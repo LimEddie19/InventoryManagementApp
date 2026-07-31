@@ -7,6 +7,7 @@ import webbrowser
 import json
 import urllib.request
 import urllib.error
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
@@ -14,7 +15,7 @@ from html import escape
 
 
 APP_NAME = "Stalk"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # GitHub-hosted release metadata used by Help > Check for Updates.
 UPDATE_INFO_URL = (
@@ -22,6 +23,12 @@ UPDATE_INFO_URL = (
 )
 
 DB_FILE = "inventory.db"
+SETTINGS_FILE = "stalk_settings.json"
+
+DEFAULT_SETTINGS = {
+    "check_updates_on_startup": True,
+    "skipped_version": "",
+}
 
 
 def now_str():
@@ -51,6 +58,8 @@ class InventoryDB:
             name TEXT NOT NULL UNIQUE,
             sku TEXT,
             price REAL NOT NULL DEFAULT 0,
+            unit_price REAL NOT NULL DEFAULT 0,
+            units_per_box INTEGER NOT NULL DEFAULT 1,
             weight TEXT,
             qty INTEGER NOT NULL DEFAULT 0,
             reorder_level INTEGER NOT NULL DEFAULT 0,
@@ -105,6 +114,12 @@ class InventoryDB:
             item_id INTEGER NOT NULL,
             item_name TEXT NOT NULL,
             qty INTEGER NOT NULL,
+            sale_type TEXT NOT NULL DEFAULT 'unit',
+            unit_qty INTEGER NOT NULL DEFAULT 0,
+            units_per_box INTEGER NOT NULL DEFAULT 1,
+            base_price REAL NOT NULL DEFAULT 0,
+            surcharge_amount REAL NOT NULL DEFAULT 0,
+            surcharge_reason TEXT,
             unit_price REAL NOT NULL DEFAULT 0,
             line_total REAL NOT NULL DEFAULT 0,
             FOREIGN KEY(invoice_id) REFERENCES invoices(id),
@@ -123,6 +138,7 @@ class InventoryDB:
         );
         """)
         self._ensure_customer_columns()
+        self._ensure_invoice_line_columns()
 
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS customer_credit_history (
@@ -134,6 +150,39 @@ class InventoryDB:
             note TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(customer_id) REFERENCES customers(id)
+        );
+        """)
+
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS customer_item_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            special_price REAL NOT NULL CHECK(special_price >= 0),
+            special_unit_price REAL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id),
+            FOREIGN KEY(item_id) REFERENCES items(id),
+            UNIQUE(customer_id, item_id)
+        );
+        """)
+
+        self._ensure_special_price_columns()
+
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS item_surcharges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            box_surcharge REAL NOT NULL DEFAULT 0 CHECK(box_surcharge >= 0),
+            unit_surcharge REAL NOT NULL DEFAULT 0 CHECK(unit_surcharge >= 0),
+            start_date TEXT NOT NULL,
+            end_date TEXT,
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(item_id) REFERENCES items(id)
         );
         """)
 
@@ -182,6 +231,7 @@ class InventoryDB:
             subtotal REAL NOT NULL DEFAULT 0,
             discount_amount REAL NOT NULL DEFAULT 0,
             credit REAL NOT NULL DEFAULT 0,
+            surcharge_amount REAL NOT NULL DEFAULT 0,
             total_sales REAL NOT NULL DEFAULT 0,
             paid_total REAL NOT NULL DEFAULT 0,
             open_total REAL NOT NULL DEFAULT 0,
@@ -192,6 +242,7 @@ class InventoryDB:
             UNIQUE(year, month)
         );
         """)
+        self._ensure_monthly_statement_columns()
         self.conn.commit()
 
     def _ensure_item_columns(self):
@@ -209,6 +260,10 @@ class InventoryDB:
             # Existing inventory gets a sensible initial baseline. The next shipment
             # will replace this with the newly replenished stock total.
             self.conn.execute("UPDATE items SET restock_total = qty WHERE restock_total = 0 AND qty > 0;")
+        if "unit_price" not in columns:
+            self.conn.execute("ALTER TABLE items ADD COLUMN unit_price REAL NOT NULL DEFAULT 0;")
+        if "units_per_box" not in columns:
+            self.conn.execute("ALTER TABLE items ADD COLUMN units_per_box INTEGER NOT NULL DEFAULT 1;")
 
     def _ensure_invoice_columns(self):
         """Add transaction-status columns to existing inventory.db files without deleting data."""
@@ -233,6 +288,39 @@ class InventoryDB:
         columns = {row[1] for row in cur.fetchall()}
         if "credit_balance" not in columns:
             self.conn.execute("ALTER TABLE customers ADD COLUMN credit_balance REAL NOT NULL DEFAULT 0;")
+
+    def _ensure_invoice_line_columns(self):
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA table_info(invoice_lines);")
+        columns = {row[1] for row in cur.fetchall()}
+        if "sale_type" not in columns:
+            self.conn.execute("ALTER TABLE invoice_lines ADD COLUMN sale_type TEXT NOT NULL DEFAULT 'unit';")
+        if "unit_qty" not in columns:
+            self.conn.execute("ALTER TABLE invoice_lines ADD COLUMN unit_qty INTEGER NOT NULL DEFAULT 0;")
+            self.conn.execute("UPDATE invoice_lines SET unit_qty = qty WHERE unit_qty = 0;")
+        if "units_per_box" not in columns:
+            self.conn.execute("ALTER TABLE invoice_lines ADD COLUMN units_per_box INTEGER NOT NULL DEFAULT 1;")
+        if "base_price" not in columns:
+            self.conn.execute("ALTER TABLE invoice_lines ADD COLUMN base_price REAL NOT NULL DEFAULT 0;")
+            self.conn.execute("UPDATE invoice_lines SET base_price = unit_price WHERE base_price = 0;")
+        if "surcharge_amount" not in columns:
+            self.conn.execute("ALTER TABLE invoice_lines ADD COLUMN surcharge_amount REAL NOT NULL DEFAULT 0;")
+        if "surcharge_reason" not in columns:
+            self.conn.execute("ALTER TABLE invoice_lines ADD COLUMN surcharge_reason TEXT;")
+
+    def _ensure_special_price_columns(self):
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA table_info(customer_item_prices);")
+        columns = {row[1] for row in cur.fetchall()}
+        if "special_unit_price" not in columns:
+            self.conn.execute("ALTER TABLE customer_item_prices ADD COLUMN special_unit_price REAL;")
+
+    def _ensure_monthly_statement_columns(self):
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA table_info(monthly_statements);")
+        columns = {row[1] for row in cur.fetchall()}
+        if "surcharge_amount" not in columns:
+            self.conn.execute("ALTER TABLE monthly_statements ADD COLUMN surcharge_amount REAL NOT NULL DEFAULT 0;")
 
     def _ensure_customer_links(self):
         """Create customer records for legacy invoices and link invoices by numeric ID."""
@@ -260,82 +348,54 @@ class InventoryDB:
         if search_text.strip():
             where = "WHERE i.name LIKE ?"
             params.append(f"%{search_text.strip()}%")
-
         cur.execute(f"""
-            SELECT
-                i.id, i.name, COALESCE(i.sku,''), COALESCE(i.price,0),
-                COALESCE(i.weight,''), i.qty,
-                COALESCE(SUM(CASE
-                    WHEN t.type = 'INVOICE'
-                     AND t.created_at >= datetime('now', '-30 days')
-                    THEN -t.qty_change ELSE 0 END), 0) AS sold_days_0_30,
-                COALESCE(SUM(CASE
-                    WHEN t.type = 'INVOICE'
-                     AND t.created_at >= datetime('now', '-60 days')
-                     AND t.created_at < datetime('now', '-30 days')
-                    THEN -t.qty_change ELSE 0 END), 0) AS sold_days_31_60,
-                COALESCE(SUM(CASE
-                    WHEN t.type = 'INVOICE'
-                     AND t.created_at >= datetime('now', '-90 days')
-                     AND t.created_at < datetime('now', '-60 days')
-                    THEN -t.qty_change ELSE 0 END), 0) AS sold_days_61_90,
-                i.updated_at
-            FROM items i
-            LEFT JOIN txns t ON t.item_id = i.id
+            SELECT i.id, i.name, COALESCE(i.sku,''), COALESCE(i.price,0),
+                   COALESCE(i.unit_price,0), COALESCE(i.units_per_box,1),
+                   COALESCE(i.weight,''), i.qty,
+                   COALESCE(SUM(CASE WHEN t.type='INVOICE' AND t.created_at >= datetime('now','-30 days') THEN -t.qty_change ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN t.type='INVOICE' AND t.created_at >= datetime('now','-60 days') AND t.created_at < datetime('now','-30 days') THEN -t.qty_change ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN t.type='INVOICE' AND t.created_at >= datetime('now','-90 days') AND t.created_at < datetime('now','-60 days') THEN -t.qty_change ELSE 0 END),0),
+                   i.updated_at
+            FROM items i LEFT JOIN txns t ON t.item_id=i.id
             {where}
-            GROUP BY i.id
-            ORDER BY i.name COLLATE NOCASE;
+            GROUP BY i.id ORDER BY i.name COLLATE NOCASE;
         """, params)
         return cur.fetchall()
 
-    def add_item(self, name, sku, price, weight):
+    def add_item(self, name, sku, box_price, unit_price, units_per_box, weight):
         name = name.strip()
-        if not name:
-            raise ValueError("Item name is required.")
-        sku = sku.strip()
-        weight = weight.strip()
-        price_value = float(price or 0)
-        if price_value < 0:
-            raise ValueError("Price must be >= 0.")
-        self.conn.execute("""
-            INSERT INTO items (name, sku, price, weight, qty, reorder_level, restock_total, updated_at)
-            VALUES (?, ?, ?, ?, 0, 0, 0, ?);
-        """, (name, sku, price_value, weight, now_str()))
-        self.conn.commit()
-        
-
-    def update_item(self, item_id, name, sku, price, weight):
-        name = name.strip()
-        if not name:
-            raise ValueError("Item name is required.")
-
-        sku = sku.strip()
-        weight = weight.strip()
+        if not name: raise ValueError("Item name is required.")
         try:
-            price_value = float(price or 0)
+            box_price_value = float(box_price or 0)
+            unit_price_value = float(unit_price or 0)
+            units_value = int(units_per_box or 1)
         except ValueError:
-            raise ValueError("Price must be a valid number.")
-
-        if price_value < 0:
-            raise ValueError("Price must be >= 0.")
-
-        cur = self.conn.cursor()
-        cur.execute("SELECT id FROM items WHERE id = ?;", (item_id,))
-        if not cur.fetchone():
-            raise ValueError("Item not found.")
-
-        cur.execute("""
-            SELECT id FROM items
-            WHERE name = ? COLLATE NOCASE AND id <> ?;
-        """, (name, item_id))
-        if cur.fetchone():
-            raise ValueError("Another item already uses that name.")
-
+            raise ValueError("Prices and units per box must be valid numbers.")
+        if box_price_value < 0 or unit_price_value < 0: raise ValueError("Prices must be >= 0.")
+        if units_value < 1: raise ValueError("Units per box must be at least 1.")
         self.conn.execute("""
-            UPDATE items
-            SET name = ?, sku = ?, price = ?, weight = ?, updated_at = ?
-            WHERE id = ?;
-        """, (name, sku, price_value, weight, now_str(), item_id))
+            INSERT INTO items (name,sku,price,unit_price,units_per_box,weight,qty,reorder_level,restock_total,updated_at)
+            VALUES (?,?,?,?,?,?,0,0,0,?);
+        """, (name,sku.strip(),box_price_value,unit_price_value,units_value,weight.strip(),now_str()))
+        self.conn.commit()
+
+    def update_item(self, item_id, name, sku, box_price, unit_price, units_per_box, weight, convert_existing=False):
+        name=name.strip()
+        if not name: raise ValueError("Item name is required.")
+        try:
+            box_value=float(box_price or 0); unit_value=float(unit_price or 0); upb=int(units_per_box or 1)
+        except ValueError: raise ValueError("Prices and units per box must be valid numbers.")
+        if box_value < 0 or unit_value < 0: raise ValueError("Prices must be >= 0.")
+        if upb < 1: raise ValueError("Units per box must be at least 1.")
+        cur=self.conn.cursor(); cur.execute("SELECT qty, units_per_box FROM items WHERE id=?",(item_id,)); row=cur.fetchone()
+        if not row: raise ValueError("Item not found.")
+        cur.execute("SELECT id FROM items WHERE name=? COLLATE NOCASE AND id<>?",(name,item_id))
+        if cur.fetchone(): raise ValueError("Another item already uses that name.")
+        qty, old_upb=row
+        if convert_existing and old_upb == 1 and upb > 1 and qty > 0:
+            qty *= upb
+        self.conn.execute("""UPDATE items SET name=?,sku=?,price=?,unit_price=?,units_per_box=?,weight=?,qty=?,updated_at=? WHERE id=?""",
+                          (name,sku.strip(),box_value,unit_value,upb,weight.strip(),qty,now_str(),item_id))
         self.conn.commit()
 
     def delete_item(self, item_id):
@@ -364,13 +424,10 @@ class InventoryDB:
         return cur.fetchone()
 
     def get_item_details(self, item_id):
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT id, name, COALESCE(price,0), COALESCE(weight,''), qty
-            FROM items
-            WHERE id = ?;
-        """, (item_id,))
-        return cur.fetchone()
+        cur=self.conn.cursor(); cur.execute("""
+            SELECT id,name,COALESCE(price,0),COALESCE(unit_price,0),COALESCE(units_per_box,1),COALESCE(weight,''),qty
+            FROM items WHERE id=?;
+        """,(item_id,)); return cur.fetchone()
 
     def list_customers(self, search_text=""):
         cur = self.conn.cursor()
@@ -499,6 +556,129 @@ class InventoryDB:
         """, (customer_id,))
         return cur.fetchall()
 
+    def get_customer_special_price(self, customer_id, item_id, sale_type="box"):
+        cur=self.conn.cursor(); cur.execute("SELECT special_price,special_unit_price FROM customer_item_prices WHERE customer_id=? AND item_id=?",(customer_id,item_id)); row=cur.fetchone()
+        if not row: return None
+        value = row[0] if sale_type == "box" else row[1]
+        return float(value) if value is not None else None
+
+    def get_effective_item_price(self, customer_id, item_id, sale_type="box"):
+        cur=self.conn.cursor()
+        if customer_id is not None:
+            cur.execute("SELECT special_price,special_unit_price FROM customer_item_prices WHERE customer_id=? AND item_id=?",(customer_id,item_id)); row=cur.fetchone()
+            if row:
+                value = row[0] if sale_type == "box" else row[1]
+                if value is not None: return float(value), "Special"
+        cur.execute("SELECT price,unit_price FROM items WHERE id=?",(item_id,)); row=cur.fetchone()
+        if not row: raise ValueError("Item not found.")
+        return float(row[0] if sale_type == "box" else row[1]), "Standard"
+
+    def set_customer_special_price(self, customer_id, item_id, sale_type, special_price):
+        if sale_type not in {"box","unit"}: raise ValueError("Price type must be box or unit.")
+        try: value=float(special_price)
+        except (TypeError,ValueError): raise ValueError("Special price must be a valid number.")
+        if value < 0: raise ValueError("Special price must be >= 0.")
+        cur=self.conn.cursor(); cur.execute("SELECT id FROM customers WHERE id=?",(customer_id,))
+        if not cur.fetchone(): raise ValueError("Customer not found.")
+        cur.execute("SELECT id FROM items WHERE id=?",(item_id,))
+        if not cur.fetchone(): raise ValueError("Item not found.")
+        existing=self.get_customer_special_price(customer_id,item_id,"box")
+        self.conn.execute("""INSERT INTO customer_item_prices(customer_id,item_id,special_price,special_unit_price,updated_at)
+            VALUES(?,?,?,?,?) ON CONFLICT(customer_id,item_id) DO UPDATE SET
+            special_price=CASE WHEN ?='box' THEN excluded.special_price ELSE customer_item_prices.special_price END,
+            special_unit_price=CASE WHEN ?='unit' THEN excluded.special_unit_price ELSE customer_item_prices.special_unit_price END,
+            updated_at=excluded.updated_at""",
+            (customer_id,item_id,value if sale_type=='box' else (existing if existing is not None else 0),value if sale_type=='unit' else None,now_str(),sale_type,sale_type))
+        self.conn.commit()
+
+    def remove_customer_special_price(self, customer_id, item_id, sale_type):
+        column = "special_price" if sale_type == "box" else "special_unit_price"
+        if sale_type == "box":
+            self.conn.execute("UPDATE customer_item_prices SET special_price=0, updated_at=? WHERE customer_id=? AND item_id=?",(now_str(),customer_id,item_id))
+        else:
+            self.conn.execute("UPDATE customer_item_prices SET special_unit_price=NULL, updated_at=? WHERE customer_id=? AND item_id=?",(now_str(),customer_id,item_id))
+        self.conn.execute("DELETE FROM customer_item_prices WHERE customer_id=? AND item_id=? AND special_price=0 AND special_unit_price IS NULL",(customer_id,item_id))
+        self.conn.commit()
+
+    def list_customer_special_prices(self, customer_id):
+        cur=self.conn.cursor(); cur.execute("""
+            SELECT i.id,i.name,COALESCE(i.price,0),COALESCE(i.unit_price,0),cip.special_price,cip.special_unit_price,cip.updated_at
+            FROM customer_item_prices cip JOIN items i ON i.id=cip.item_id WHERE cip.customer_id=? ORDER BY i.name COLLATE NOCASE
+        """,(customer_id,)); return cur.fetchall()
+
+    def save_item_surcharge(self, item_id, reason, box_surcharge, unit_surcharge, start_date, end_date="", note=""):
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("Surcharge reason is required.")
+        try:
+            box_value = float(box_surcharge or 0)
+            unit_value = float(unit_surcharge or 0)
+        except ValueError:
+            raise ValueError("Surcharge amounts must be valid numbers.")
+        if box_value < 0 or unit_value < 0:
+            raise ValueError("Surcharges cannot be negative.")
+        if box_value == 0 and unit_value == 0:
+            raise ValueError("Enter a box or unit surcharge greater than zero.")
+        try:
+            start = datetime.strptime(start_date.strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            raise ValueError("Start date must use YYYY-MM-DD.")
+        end = end_date.strip()
+        if end:
+            try:
+                end = datetime.strptime(end, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except ValueError:
+                raise ValueError("End date must use YYYY-MM-DD.")
+            if end < start:
+                raise ValueError("End date cannot be earlier than the start date.")
+        self.conn.execute("""
+            INSERT INTO item_surcharges
+                (item_id, reason, box_surcharge, unit_surcharge, start_date, end_date, active, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?);
+        """, (item_id, reason, box_value, unit_value, start, end or None, note.strip(), now_str(), now_str()))
+        self.conn.commit()
+
+    def list_item_surcharges(self, item_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, reason, box_surcharge, unit_surcharge, start_date, COALESCE(end_date,''),
+                   active, COALESCE(note,''), updated_at
+            FROM item_surcharges WHERE item_id = ? ORDER BY start_date DESC, id DESC;
+        """, (item_id,))
+        return cur.fetchall()
+
+    def set_item_surcharge_active(self, surcharge_id, active):
+        self.conn.execute(
+            "UPDATE item_surcharges SET active = ?, updated_at = ? WHERE id = ?;",
+            (1 if active else 0, now_str(), surcharge_id),
+        )
+        self.conn.commit()
+
+    def get_active_item_surcharge(self, item_id, sale_type, on_date=None):
+        sale_type = sale_type.lower().strip()
+        if sale_type not in {"box", "unit"}:
+            raise ValueError("Sale type must be box or unit.")
+        date_text = on_date or datetime.now().strftime("%Y-%m-%d")
+        column = "box_surcharge" if sale_type == "box" else "unit_surcharge"
+        cur = self.conn.cursor()
+        cur.execute(f"""
+            SELECT {column}, reason
+            FROM item_surcharges
+            WHERE item_id = ? AND active = 1
+              AND start_date <= ?
+              AND (end_date IS NULL OR end_date = '' OR end_date >= ?)
+              AND {column} > 0
+            ORDER BY start_date DESC, id DESC
+            LIMIT 1;
+        """, (item_id, date_text, date_text))
+        row = cur.fetchone()
+        return (float(row[0]), row[1]) if row else (0.0, "")
+
+    def get_invoice_price_details(self, customer_id, item_id, sale_type="box"):
+        base_price, pricing_type = self.get_effective_item_price(customer_id, item_id, sale_type)
+        surcharge, reason = self.get_active_item_surcharge(item_id, sale_type)
+        return base_price, surcharge, base_price + surcharge, pricing_type, reason
+
     def list_refundable_invoices(self):
         cur = self.conn.cursor()
         cur.execute("""
@@ -508,18 +688,11 @@ class InventoryDB:
         return cur.fetchall()
 
     def get_refundable_invoice_lines(self, invoice_id):
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT il.id, il.item_id, il.item_name, il.qty,
-                   COALESCE(SUM(rl.qty),0), il.unit_price
-            FROM invoice_lines il
-            LEFT JOIN refund_lines rl ON rl.invoice_line_id = il.id
-            WHERE il.invoice_id = ?
-            GROUP BY il.id
-            HAVING il.qty - COALESCE(SUM(rl.qty),0) > 0
-            ORDER BY il.id;
-        """, (invoice_id,))
-        return cur.fetchall()
+        cur=self.conn.cursor(); cur.execute("""
+            SELECT il.id,il.item_id,il.item_name,il.qty,COALESCE(SUM(rl.qty),0),il.unit_price,il.sale_type,il.units_per_box
+            FROM invoice_lines il LEFT JOIN refund_lines rl ON rl.invoice_line_id=il.id
+            WHERE il.invoice_id=? GROUP BY il.id HAVING il.qty-COALESCE(SUM(rl.qty),0)>0 ORDER BY il.id
+        """,(invoice_id,)); return cur.fetchall()
 
     def save_refund(self, invoice_id, refund_method, lines, note=""):
         allowed = {"store credit", "cash", "original payment", "other"}
@@ -540,35 +713,35 @@ class InventoryDB:
             if return_qty <= 0:
                 raise ValueError("Return quantities must be greater than zero.")
             cur.execute("""
-                SELECT il.item_id, il.item_name, il.qty, il.unit_price,
+                SELECT il.item_id, il.item_name, il.qty, il.unit_price, il.sale_type, il.units_per_box,
                        COALESCE((SELECT SUM(rl.qty) FROM refund_lines rl WHERE rl.invoice_line_id = il.id),0)
                 FROM invoice_lines il WHERE il.id = ? AND il.invoice_id = ?;
             """, (invoice_line_id, invoice_id))
             row = cur.fetchone()
             if not row:
                 raise ValueError("A selected invoice line was not found.")
-            item_id, item_name, sold_qty, unit_price, already_refunded = row
+            item_id, item_name, sold_qty, unit_price, sale_type, units_per_box, already_refunded = row
             available = sold_qty - already_refunded
             if return_qty > available:
                 raise ValueError(f"Only {available} unit(s) of {item_name} remain refundable.")
             line_total = float(unit_price) * return_qty
             total += line_total
-            validated.append((invoice_line_id, item_id, item_name, return_qty, float(unit_price), line_total))
+            validated.append((invoice_line_id, item_id, item_name, return_qty, float(unit_price), line_total, sale_type, units_per_box))
         cur.execute("""
             INSERT INTO refunds (invoice_id, customer_id, refund_method, total, note, created_at)
             VALUES (?, ?, ?, ?, ?, ?);
         """, (invoice_id, customer_id, refund_method, total, note.strip(), now_str()))
         refund_id = cur.lastrowid
-        for invoice_line_id, item_id, item_name, qty, unit_price, line_total in validated:
+        for invoice_line_id, item_id, item_name, qty, unit_price, line_total, sale_type, units_per_box in validated:
             cur.execute("""
                 INSERT INTO refund_lines (refund_id, invoice_line_id, item_id, item_name, qty, unit_price, line_total)
                 VALUES (?, ?, ?, ?, ?, ?, ?);
             """, (refund_id, invoice_line_id, item_id, item_name, qty, unit_price, line_total))
-            cur.execute("UPDATE items SET qty = qty + ?, updated_at = ? WHERE id = ?;", (qty, now_str(), item_id))
+            cur.execute("UPDATE items SET qty = qty + ?, updated_at = ? WHERE id = ?;", (qty * (units_per_box if sale_type == "box" else 1), now_str(), item_id))
             cur.execute("""
                 INSERT INTO txns (type, ref_number, item_id, qty_change, note, created_at)
                 VALUES ('SHIPMENT', ?, ?, ?, ?, ?);
-            """, (f"REFUND-{ref_number}", item_id, qty, f"Customer return: {note.strip()}", now_str()))
+            """, (f"REFUND-{ref_number}", item_id, qty * (units_per_box if sale_type == "box" else 1), f"Customer return: {note.strip()}", now_str()))
         if refund_method == "store credit":
             if customer_id is None:
                 raise ValueError("Store credit requires an invoice linked to a saved customer.")
@@ -608,11 +781,13 @@ class InventoryDB:
         self.conn.execute("UPDATE invoices SET printable_path = ? WHERE id = ?;", (printable_path, invoice_id))
         self.conn.commit()
 
-    def save_invoice_line(self, invoice_id, item_id, item_name, qty, unit_price):
-        self.conn.execute("""
-            INSERT INTO invoice_lines (invoice_id, item_id, item_name, qty, unit_price, line_total)
-            VALUES (?, ?, ?, ?, ?, ?);
-        """, (invoice_id, item_id, item_name, int(qty), float(unit_price), float(unit_price) * int(qty)))
+    def save_invoice_line(self, invoice_id, item_id, item_name, qty, sale_type, unit_qty, units_per_box, base_price, surcharge_amount, charged_price, surcharge_reason=""):
+        self.conn.execute("""INSERT INTO invoice_lines(
+                invoice_id,item_id,item_name,qty,sale_type,unit_qty,units_per_box,
+                base_price,surcharge_amount,surcharge_reason,unit_price,line_total
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (invoice_id,item_id,item_name,int(qty),sale_type,int(unit_qty),int(units_per_box),
+             float(base_price),float(surcharge_amount),surcharge_reason.strip(),float(charged_price),float(charged_price)*int(qty)))
         self.conn.commit()
 
     def list_invoices(self):
@@ -637,14 +812,7 @@ class InventoryDB:
         return cur.fetchone()
 
     def get_invoice_lines(self, invoice_id):
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT item_name, qty, unit_price, line_total
-            FROM invoice_lines
-            WHERE invoice_id = ?
-            ORDER BY id;
-        """, (invoice_id,))
-        return cur.fetchall()
+        cur=self.conn.cursor(); cur.execute("""SELECT item_name,qty,sale_type,base_price,surcharge_amount,COALESCE(surcharge_reason,''),unit_price,line_total FROM invoice_lines WHERE invoice_id=? ORDER BY id""",(invoice_id,)); return cur.fetchall()
 
     def close_invoice(self, invoice_id, payment_method):
         payment_method = payment_method.strip()
@@ -701,10 +869,13 @@ class InventoryDB:
                 COALESCE(SUM(CASE WHEN status != 'void' THEN total ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status = 'closed' THEN total ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN status = 'open' THEN total ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN status = 'void' THEN total ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN status = 'void' THEN total ELSE 0 END), 0),
+                COALESCE((SELECT SUM(il.surcharge_amount * il.qty)
+                          FROM invoice_lines il JOIN invoices inv2 ON inv2.id = il.invoice_id
+                          WHERE inv2.created_at >= ? AND inv2.created_at < ? AND inv2.status != 'void'), 0)
             FROM invoices
             WHERE created_at >= ? AND created_at < ?;
-        """, (start, end))
+        """, (start, end, start, end))
         row = cur.fetchone()
         return {
             "year": int(year),
@@ -721,16 +892,17 @@ class InventoryDB:
             "paid_total": row[8] or 0,
             "open_total": row[9] or 0,
             "void_total": row[10] or 0,
+            "surcharge_amount": row[11] or 0,
         }
 
     def save_monthly_statement(self, data, printable_path=""):
         self.conn.execute("""
             INSERT INTO monthly_statements (
                 year, month, period_label, invoice_count, open_count, closed_count, void_count,
-                subtotal, discount_amount, credit, total_sales, paid_total, open_total, void_total,
+                subtotal, discount_amount, credit, surcharge_amount, total_sales, paid_total, open_total, void_total,
                 printable_path, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(year, month) DO UPDATE SET
                 period_label = excluded.period_label,
                 invoice_count = excluded.invoice_count,
@@ -740,6 +912,7 @@ class InventoryDB:
                 subtotal = excluded.subtotal,
                 discount_amount = excluded.discount_amount,
                 credit = excluded.credit,
+                surcharge_amount = excluded.surcharge_amount,
                 total_sales = excluded.total_sales,
                 paid_total = excluded.paid_total,
                 open_total = excluded.open_total,
@@ -749,7 +922,7 @@ class InventoryDB:
         """, (
             data["year"], data["month"], data["period_label"], data["invoice_count"],
             data["open_count"], data["closed_count"], data["void_count"],
-            data["subtotal"], data["discount_amount"], data["credit"], data["total_sales"],
+            data["subtotal"], data["discount_amount"], data["credit"], data["surcharge_amount"], data["total_sales"],
             data["paid_total"], data["open_total"], data["void_total"],
             printable_path, now_str(), now_str()
         ))
@@ -759,7 +932,7 @@ class InventoryDB:
         cur = self.conn.cursor()
         cur.execute("""
             SELECT id, year, month, period_label, invoice_count, open_count, closed_count, void_count,
-                   subtotal, discount_amount, credit, total_sales, paid_total, open_total, void_total,
+                   subtotal, discount_amount, credit, surcharge_amount, total_sales, paid_total, open_total, void_total,
                    COALESCE(printable_path,''), created_at, updated_at
             FROM monthly_statements
             WHERE year = ? AND month = ?;
@@ -770,7 +943,7 @@ class InventoryDB:
         cur = self.conn.cursor()
         cur.execute("""
             SELECT id, year, month, period_label, invoice_count, open_count, closed_count, void_count,
-                   subtotal, discount_amount, credit, total_sales, paid_total, open_total, void_total,
+                   subtotal, discount_amount, credit, surcharge_amount, total_sales, paid_total, open_total, void_total,
                    COALESCE(printable_path,''), updated_at
             FROM monthly_statements
             ORDER BY year DESC, month DESC;
@@ -801,6 +974,7 @@ class InventoryDB:
                 COALESCE(SUM(subtotal), 0),
                 COALESCE(SUM(discount_amount), 0),
                 COALESCE(SUM(credit), 0),
+                COALESCE(SUM(surcharge_amount), 0),
                 COALESCE(SUM(total_sales), 0),
                 COALESCE(SUM(paid_total), 0),
                 COALESCE(SUM(open_total), 0),
@@ -819,10 +993,11 @@ class InventoryDB:
             "subtotal": row[5] or 0,
             "discount_amount": row[6] or 0,
             "credit": row[7] or 0,
-            "total_sales": row[8] or 0,
-            "paid_total": row[9] or 0,
-            "open_total": row[10] or 0,
-            "void_total": row[11] or 0,
+            "surcharge_amount": row[8] or 0,
+            "total_sales": row[9] or 0,
+            "paid_total": row[10] or 0,
+            "open_total": row[11] or 0,
+            "void_total": row[12] or 0,
         }
 
     def monthly_statements_for_year(self, year):
@@ -835,62 +1010,28 @@ class InventoryDB:
         """, (int(year),))
         return cur.fetchall()
 
-    def record_shipment(self, ref_number, item_id, qty_add, note=""):
-        if qty_add <= 0:
-            raise ValueError("Quantity must be > 0.")
-        ref_number = ref_number.strip()
-        if not ref_number:
-            raise ValueError("Shipment number is required.")
-        note = note.strip()
-
-        cur = self.conn.cursor()
-        cur.execute("SELECT qty FROM items WHERE id = ?;", (item_id,))
-        row = cur.fetchone()
-        if not row:
-            raise ValueError("Item not found.")
-
-        new_qty = row[0] + qty_add
-
-        self.conn.execute("""
-            UPDATE items
-            SET qty = ?, restock_total = ?, updated_at = ?
-            WHERE id = ?;
-        """, (new_qty, new_qty, now_str(), item_id))
-
-        self.conn.execute("""
-            INSERT INTO txns (type, ref_number, item_id, qty_change, note, created_at)
-            VALUES ('SHIPMENT', ?, ?, ?, ?, ?);
-        """, (ref_number, item_id, qty_add, note, now_str()))
+    def record_shipment(self, ref_number, item_id, quantity, received_as="box", note=""):
+        if quantity <= 0: raise ValueError("Quantity must be > 0.")
+        if received_as not in {"box","unit"}: raise ValueError("Received as must be box or unit.")
+        ref_number=ref_number.strip()
+        if not ref_number: raise ValueError("Shipment number is required.")
+        cur=self.conn.cursor(); cur.execute("SELECT qty,units_per_box FROM items WHERE id=?",(item_id,)); row=cur.fetchone()
+        if not row: raise ValueError("Item not found.")
+        units_added=int(quantity)*(int(row[1]) if received_as=='box' else 1); new_qty=row[0]+units_added
+        self.conn.execute("UPDATE items SET qty=?,restock_total=?,updated_at=? WHERE id=?",(new_qty,new_qty,now_str(),item_id))
+        self.conn.execute("INSERT INTO txns(type,ref_number,item_id,qty_change,note,created_at) VALUES('SHIPMENT',?,?,?,?,?)",
+                          (ref_number,item_id,units_added,f"{quantity} {received_as}(s). {note.strip()}",now_str()))
         self.conn.commit()
 
-    def record_invoice(self, ref_number, item_id, qty_sub, note=""):
-        if qty_sub <= 0:
-            raise ValueError("Quantity must be > 0.")
-        ref_number = ref_number.strip()
-        if not ref_number:
-            raise ValueError("Invoice number is required.")
-        note = note.strip()
-
-        cur = self.conn.cursor()
-        cur.execute("SELECT qty FROM items WHERE id = ?;", (item_id,))
-        row = cur.fetchone()
-        if not row:
-            raise ValueError("Item not found.")
-
-        current = row[0]
-        if qty_sub > current:
-            raise ValueError(f"Not enough stock. Current stock is {current}.")
-
-        new_qty = current - qty_sub
-
-        self.conn.execute("""
-            UPDATE items SET qty = ?, updated_at = ? WHERE id = ?;
-        """, (new_qty, now_str(), item_id))
-
-        self.conn.execute("""
-            INSERT INTO txns (type, ref_number, item_id, qty_change, note, created_at)
-            VALUES ('INVOICE', ?, ?, ?, ?, ?);
-        """, (ref_number, item_id, -qty_sub, note, now_str()))
+    def record_invoice(self, ref_number, item_id, unit_qty, note=""):
+        if unit_qty <= 0: raise ValueError("Quantity must be > 0.")
+        ref_number=ref_number.strip()
+        if not ref_number: raise ValueError("Invoice number is required.")
+        cur=self.conn.cursor(); cur.execute("SELECT qty FROM items WHERE id=?",(item_id,)); row=cur.fetchone()
+        if not row: raise ValueError("Item not found.")
+        if unit_qty > row[0]: raise ValueError(f"Not enough stock. Current stock is {row[0]} unit(s).")
+        self.conn.execute("UPDATE items SET qty=?,updated_at=? WHERE id=?",(row[0]-unit_qty,now_str(),item_id))
+        self.conn.execute("INSERT INTO txns(type,ref_number,item_id,qty_change,note,created_at) VALUES('INVOICE',?,?,?,?,?)",(ref_number,item_id,-unit_qty,note.strip(),now_str()))
         self.conn.commit()
 
     def list_history(self, limit=200):
@@ -908,7 +1049,7 @@ class InventoryDB:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Simple Inventory")
+        self.title("Tea Gather Inventory")
 
         # Size the main window to the available display. This works on Windows,
         # Chromebook Linux, and smaller laptop screens without forcing a
@@ -952,16 +1093,22 @@ class App(tk.Tk):
 
         self.shipment_lines = []
         self.invoice_lines = []
+        self.update_settings = self._load_update_settings()
+        self._update_check_running = False
 
         self._build_ui()
         self._build_menu_bar()
         self.auto_save_completed_monthly_statements()
         self.refresh_all()
 
+        # Perform a quiet update check after the interface has finished loading.
+        if self.update_settings.get("check_updates_on_startup", True):
+            self.after(1500, self.check_for_updates_in_background)
+
     def _build_ui(self):
         header = ttk.Frame(self, padding=12)
         header.pack(fill="x")
-        ttk.Label(header, text="Simple Inventory", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="Tea Gather Inventory", style="Title.TLabel").pack(side="left")
         ttk.Label(header, text=f"Database: {DB_FILE}", foreground="#666").pack(side="right")
 
         self.notebook = ttk.Notebook(self)
@@ -1033,6 +1180,7 @@ class App(tk.Tk):
 
         help_menu = tk.Menu(menu_bar, tearoff=False)
         help_menu.add_command(label="Check for Updates...", command=self.check_for_updates)
+        help_menu.add_command(label="Update Settings...", command=self.show_update_settings)
         help_menu.add_separator()
         help_menu.add_command(label="About", command=self.show_about)
         menu_bar.add_cascade(label="Help", menu=help_menu)
@@ -1114,6 +1262,85 @@ class App(tk.Tk):
                 pass
             messagebox.showerror("Restore Error", f"Could not restore the database.\n\n{exc}")
 
+    def _load_update_settings(self):
+        settings = dict(DEFAULT_SETTINGS)
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as settings_file:
+                saved = json.load(settings_file)
+            if isinstance(saved, dict):
+                settings.update(saved)
+        except (OSError, json.JSONDecodeError):
+            pass
+        return settings
+
+    def _save_update_settings(self):
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as settings_file:
+                json.dump(self.update_settings, settings_file, indent=2)
+        except OSError as exc:
+            messagebox.showerror(
+                "Settings Error",
+                f"Stalk could not save the update settings.\n\n{exc}",
+            )
+
+    def show_update_settings(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Update Settings")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=18)
+        frame.pack(fill="both", expand=True)
+
+        startup_var = tk.BooleanVar(
+            value=bool(self.update_settings.get("check_updates_on_startup", True))
+        )
+        ttk.Checkbutton(
+            frame,
+            text="Automatically check for updates when Stalk starts",
+            variable=startup_var,
+        ).pack(anchor="w")
+
+        skipped = str(self.update_settings.get("skipped_version", "")).strip()
+        skipped_label = ttk.Label(
+            frame,
+            text=(
+                f"Skipped version: {skipped}"
+                if skipped
+                else "No update version is currently skipped."
+            ),
+            foreground="#666",
+        )
+        skipped_label.pack(anchor="w", pady=(10, 0))
+
+        def clear_skipped():
+            self.update_settings["skipped_version"] = ""
+            skipped_label.config(text="No update version is currently skipped.")
+
+        if skipped:
+            ttk.Button(frame, text="Clear Skipped Version", command=clear_skipped).pack(
+                anchor="w", pady=(8, 0)
+            )
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(18, 0))
+
+        def save_settings():
+            self.update_settings["check_updates_on_startup"] = startup_var.get()
+            self._save_update_settings()
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(
+            buttons, text="Save", style="Big.TButton", command=save_settings
+        ).pack(side="right", padx=(0, 8))
+
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + max((self.winfo_width() - dialog.winfo_width()) // 2, 0)
+        y = self.winfo_rooty() + max((self.winfo_height() - dialog.winfo_height()) // 2, 0)
+        dialog.geometry(f"+{x}+{y}")
+
     @staticmethod
     def _version_tuple(version):
         """Convert a version such as 1.2.3 into a comparable integer tuple."""
@@ -1127,76 +1354,159 @@ class App(tk.Tk):
             values.append(0)
         return tuple(values)
 
-    def check_for_updates(self):
-        """Check a small JSON file in the GitHub repository for a newer release."""
+    def _fetch_update_info(self):
         if "USERNAME/REPOSITORY" in UPDATE_INFO_URL:
-            messagebox.showwarning(
-                "Update Check Not Configured",
-                "The GitHub update URL has not been configured yet.\n\n"
-                "Edit UPDATE_INFO_URL near the top of the Python source file.",
-            )
+            raise ValueError("The GitHub update URL has not been configured.")
+
+        request = urllib.request.Request(
+            UPDATE_INFO_URL,
+            headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            update_info = json.loads(response.read().decode("utf-8"))
+
+        latest_version = str(update_info.get("version", "")).strip()
+        if not latest_version:
+            raise ValueError("The update file does not contain a version.")
+        return update_info
+
+    def check_for_updates_in_background(self):
+        """Quietly check for a newer release without delaying application startup."""
+        if self._update_check_running:
             return
+        self._update_check_running = True
 
-        try:
-            request = urllib.request.Request(
-                UPDATE_INFO_URL,
-                headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                update_info = json.loads(response.read().decode("utf-8"))
+        def worker():
+            try:
+                update_info = self._fetch_update_info()
+            except Exception:
+                # Startup checks remain silent when offline or GitHub is unavailable.
+                self.after(0, lambda: setattr(self, "_update_check_running", False))
+                return
 
-            latest_version = str(update_info.get("version", "")).strip()
-            if not latest_version:
-                raise ValueError("The update file does not contain a version.")
+            def finish():
+                self._update_check_running = False
+                latest = str(update_info.get("version", "")).strip()
+                skipped = str(self.update_settings.get("skipped_version", "")).strip()
+                if (
+                    self._version_tuple(latest) > self._version_tuple(APP_VERSION)
+                    and self._version_tuple(latest) != self._version_tuple(skipped)
+                ):
+                    self._show_update_available_dialog(update_info, allow_skip=True)
 
-            notes = update_info.get("notes", [])
-            if isinstance(notes, list):
-                notes_text = "\n".join(f"• {note}" for note in notes)
-            else:
-                notes_text = str(notes).strip()
+            self.after(0, finish)
 
-            release_url = str(update_info.get("release_url", "")).strip()
+        threading.Thread(target=worker, daemon=True).start()
 
-            if self._version_tuple(latest_version) > self._version_tuple(APP_VERSION):
-                details = (
-                    f"A new version of {APP_NAME} is available.\n\n"
-                    f"Installed: {APP_VERSION}\n"
-                    f"Latest: {latest_version}"
-                )
-                if notes_text:
-                    details += f"\n\nWhat's new:\n{notes_text}"
-                details += "\n\nOpen the GitHub release page?"
+    def check_for_updates(self):
+        """Manually check GitHub for a newer release."""
+        if self._update_check_running:
+            messagebox.showinfo("Update Check", "An update check is already in progress.")
+            return
+        self._update_check_running = True
 
-                if messagebox.askyesno("Update Available", details):
-                    if release_url:
-                        webbrowser.open(release_url)
-                    else:
-                        messagebox.showinfo(
-                            "Release Link Missing",
-                            "The update was found, but version.json does not contain a release_url.",
-                        )
+        def worker():
+            try:
+                update_info = self._fetch_update_info()
+            except (urllib.error.URLError, TimeoutError):
+                self.after(0, lambda: self._finish_manual_update_error(
+                    "Unable to Check for Updates",
+                    "Stalk could not connect to GitHub.\n\nCheck the Internet connection and try again.",
+                ))
+                return
+            except (json.JSONDecodeError, ValueError, KeyError) as exc:
+                self.after(0, lambda exc=exc: self._finish_manual_update_error(
+                    "Invalid Update Information",
+                    f"The GitHub update file could not be read.\n\n{exc}",
+                ))
+                return
+            except Exception as exc:
+                self.after(0, lambda exc=exc: self._finish_manual_update_error(
+                    "Update Check Error",
+                    f"An unexpected error occurred while checking for updates.\n\n{exc}",
+                ))
+                return
+
+            def finish():
+                self._update_check_running = False
+                latest = str(update_info.get("version", "")).strip()
+                if self._version_tuple(latest) > self._version_tuple(APP_VERSION):
+                    self._show_update_available_dialog(update_info, allow_skip=True)
+                else:
+                    messagebox.showinfo(
+                        "Stalk Is Up to Date",
+                        f"You are running the latest version.\n\nVersion {APP_VERSION}",
+                    )
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_manual_update_error(self, title, message):
+        self._update_check_running = False
+        messagebox.showerror(title, message)
+
+    def _show_update_available_dialog(self, update_info, allow_skip=True):
+        latest_version = str(update_info.get("version", "")).strip()
+        release_url = str(update_info.get("release_url", "")).strip()
+        notes = update_info.get("notes", [])
+        if isinstance(notes, list):
+            notes_text = "\n".join(f"• {note}" for note in notes)
+        else:
+            notes_text = str(notes).strip()
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Stalk Update Available")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Stalk Update Available", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text=f"Installed version: {APP_VERSION}\nLatest version: {latest_version}",
+        ).pack(anchor="w", pady=(10, 0))
+
+        if notes_text:
+            notes_box = ttk.LabelFrame(frame, text="What's New", padding=10)
+            notes_box.pack(fill="both", expand=True, pady=(12, 0))
+            ttk.Label(notes_box, text=notes_text, justify="left", wraplength=520).pack(anchor="w")
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(18, 0))
+
+        def open_release():
+            if release_url:
+                webbrowser.open(release_url)
+                dialog.destroy()
             else:
                 messagebox.showinfo(
-                    "Stalk Is Up to Date",
-                    f"You are running the latest version.\n\nVersion {APP_VERSION}",
+                    "Release Link Missing",
+                    "The update was found, but version.json does not contain a release_url.",
+                    parent=dialog,
                 )
 
-        except (urllib.error.URLError, TimeoutError):
-            messagebox.showerror(
-                "Unable to Check for Updates",
-                "Stalk could not connect to GitHub.\n\n"
-                "Check the Internet connection and try again.",
+        def skip_version():
+            self.update_settings["skipped_version"] = latest_version
+            self._save_update_settings()
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Later", command=dialog.destroy).pack(side="right")
+        if allow_skip:
+            ttk.Button(buttons, text="Skip This Version", command=skip_version).pack(
+                side="right", padx=(0, 8)
             )
-        except (json.JSONDecodeError, ValueError, KeyError) as exc:
-            messagebox.showerror(
-                "Invalid Update Information",
-                f"The GitHub update file could not be read.\n\n{exc}",
-            )
-        except Exception as exc:
-            messagebox.showerror(
-                "Update Check Error",
-                f"An unexpected error occurred while checking for updates.\n\n{exc}",
-            )
+        ttk.Button(
+            buttons, text="View Update", style="Big.TButton", command=open_release
+        ).pack(side="right", padx=(0, 8))
+
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + max((self.winfo_width() - dialog.winfo_width()) // 2, 0)
+        y = self.winfo_rooty() + max((self.winfo_height() - dialog.winfo_height()) // 2, 0)
+        dialog.geometry(f"+{x}+{y}")
 
     def show_about(self):
         messagebox.showinfo(
@@ -1224,6 +1534,8 @@ class App(tk.Tk):
         self.new_name = tk.StringVar()
         self.new_sku = tk.StringVar()
         self.new_price = tk.StringVar(value="0.00")
+        self.new_unit_price = tk.StringVar(value="0.00")
+        self.new_units_per_box = tk.StringVar(value="1")
         self.new_weight = tk.StringVar()
 
         row1 = ttk.Frame(add_box)
@@ -1235,10 +1547,14 @@ class App(tk.Tk):
 
         row2 = ttk.Frame(add_box)
         row2.pack(fill="x", pady=4)
-        ttk.Label(row2, text="Price:", width=22).pack(side="left")
+        ttk.Label(row2, text="Box Price:", width=22).pack(side="left")
         ttk.Entry(row2, textvariable=self.new_price, width=10).pack(side="left", padx=8)
-        ttk.Label(row2, text="Weight:", width=14).pack(side="left")
-        ttk.Entry(row2, textvariable=self.new_weight, width=18).pack(side="left", padx=8)
+        ttk.Label(row2, text="Unit Price:", width=14).pack(side="left")
+        ttk.Entry(row2, textvariable=self.new_unit_price, width=10).pack(side="left", padx=8)
+        ttk.Label(row2, text="Units/Box:").pack(side="left", padx=(8,0))
+        ttk.Entry(row2, textvariable=self.new_units_per_box, width=7).pack(side="left", padx=8)
+        ttk.Label(row2, text="Weight:").pack(side="left")
+        ttk.Entry(row2, textvariable=self.new_weight, width=14).pack(side="left", padx=8)
 
         row3 = ttk.Frame(add_box)
         row3.pack(fill="x", pady=4)
@@ -1252,6 +1568,7 @@ class App(tk.Tk):
         action_row = ttk.Frame(self.tab_inventory)
         action_row.pack(fill="x", pady=(0, 10))
         ttk.Button(action_row, text="Edit Selected Item", style="Big.TButton", command=self.on_edit_item).pack(side="left")
+        ttk.Button(action_row, text="Manage Temporary Surcharges", style="Big.TButton", command=self.on_manage_surcharges).pack(side="left", padx=(8, 0))
         ttk.Button(action_row, text="Delete Selected Item", style="Big.TButton", command=self.on_delete_item).pack(side="left", padx=(8, 0))
         ttk.Button(action_row, text="Export Inventory CSV", style="Big.TButton",
                    command=lambda: self.export_treeview_csv(self.tree, "inventory")).pack(side="left", padx=(8, 0))
@@ -1260,13 +1577,17 @@ class App(tk.Tk):
         table_frame = ttk.Frame(self.tab_inventory)
         table_frame.pack(fill="both", expand=True)
 
-        cols = ("name", "sku", "weight", "price", "qty", "value", "daily_usage", "doh", "priority", "updated")
+        cols = ("name", "sku", "weight", "upb", "box_price", "unit_price", "units", "boxes", "loose", "value", "daily_usage", "doh", "priority", "updated")
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=12)
         self.tree.heading("name", text="Item Name")
         self.tree.heading("sku", text="SKU")
         self.tree.heading("weight", text="Weight")
-        self.tree.heading("price", text="Price")
-        self.tree.heading("qty", text="In Stock")
+        self.tree.heading("upb", text="Units/Box")
+        self.tree.heading("box_price", text="Box Price")
+        self.tree.heading("unit_price", text="Unit Price")
+        self.tree.heading("units", text="Total Units")
+        self.tree.heading("boxes", text="Full Boxes")
+        self.tree.heading("loose", text="Loose Units")
         self.tree.heading("value", text="Inventory Value")
         self.tree.heading("daily_usage", text="Avg Daily Out")
         self.tree.heading("doh", text="Days On Hand")
@@ -1276,8 +1597,12 @@ class App(tk.Tk):
         self.tree.column("name", width=240, anchor="w")
         self.tree.column("sku", width=110, anchor="center")
         self.tree.column("weight", width=110, anchor="center")
-        self.tree.column("price", width=90, anchor="e")
-        self.tree.column("qty", width=90, anchor="center")
+        self.tree.column("upb", width=85, anchor="center")
+        self.tree.column("box_price", width=90, anchor="e")
+        self.tree.column("unit_price", width=90, anchor="e")
+        self.tree.column("units", width=90, anchor="center")
+        self.tree.column("boxes", width=85, anchor="center")
+        self.tree.column("loose", width=85, anchor="center")
         self.tree.column("value", width=130, anchor="e")
         self.tree.column("daily_usage", width=115, anchor="center")
         self.tree.column("doh", width=115, anchor="center")
@@ -1312,11 +1637,15 @@ class App(tk.Tk):
                 self.new_name.get(),
                 self.new_sku.get(),
                 self.new_price.get(),
+                self.new_unit_price.get(),
+                self.new_units_per_box.get(),
                 self.new_weight.get()
             )
             self.new_name.set("")
             self.new_sku.set("")
             self.new_price.set("0.00")
+            self.new_unit_price.set("0.00")
+            self.new_units_per_box.set("1")
             self.new_weight.set("")
             messagebox.showinfo("Added", "Item added.")
             self.refresh_all()
@@ -1326,83 +1655,100 @@ class App(tk.Tk):
             messagebox.showerror("Error", str(e))
 
     def on_edit_item(self):
+        selected=self.tree.selection()
+        if not selected: messagebox.showerror("Error","Select an item to edit."); return
+        item_id=int(selected[0]); d=self.db.get_item_details(item_id)
+        if not d: messagebox.showerror("Error","Item not found."); return
+        _id,name,box_price,unit_price,upb,weight,qty=d
+        sku=self.db.conn.execute("SELECT COALESCE(sku,'') FROM items WHERE id=?",(item_id,)).fetchone()[0]
+        dialog=tk.Toplevel(self); dialog.title("Edit Item"); dialog.transient(self); dialog.grab_set()
+        frame=ttk.Frame(dialog,padding=16); frame.pack(fill="both",expand=True)
+        vars_=[tk.StringVar(value=v) for v in (name,sku,f"{box_price:.2f}",f"{unit_price:.2f}",str(upb),weight)]
+        labels=("Item Name:","SKU:","Box Price:","Unit Price:","Units Per Box:","Weight:")
+        for r,(label,var) in enumerate(zip(labels,vars_)):
+            ttk.Label(frame,text=label,width=17).grid(row=r,column=0,sticky="w",pady=5); ttk.Entry(frame,textvariable=var,width=34).grid(row=r,column=1,sticky="ew",pady=5)
+        ttk.Label(frame,text=f"Current inventory: {qty} unit(s) = {qty//upb} box(es) + {qty%upb} loose",foreground="#666").grid(row=6,column=0,columnspan=2,sticky="w",pady=6)
+        def save():
+            try:
+                new_upb=int(vars_[4].get() or 1); convert=False
+                if upb==1 and new_upb>1 and qty>0:
+                    convert=messagebox.askyesno("Convert Existing Stock", f"Current stock is {qty}. Does that represent {qty} BOXES?\n\nYes: convert to {qty*new_upb} units.\nNo: keep {qty} units.", parent=dialog)
+                self.db.update_item(item_id,vars_[0].get(),vars_[1].get(),vars_[2].get(),vars_[3].get(),vars_[4].get(),vars_[5].get(),convert)
+                dialog.destroy(); self.refresh_all(); messagebox.showinfo("Updated","Item details updated.")
+            except Exception as e: messagebox.showerror("Error",str(e),parent=dialog)
+        buttons=ttk.Frame(frame); buttons.grid(row=7,column=0,columnspan=2,sticky="e",pady=(8,0)); ttk.Button(buttons,text="Cancel",command=dialog.destroy).pack(side="right"); ttk.Button(buttons,text="Save Changes",style="Big.TButton",command=save).pack(side="right",padx=8)
+        dialog.bind("<Return>",lambda e:save()); dialog.bind("<Escape>",lambda e:dialog.destroy())
+
+    def on_manage_surcharges(self):
         selected = self.tree.selection()
         if not selected:
-            messagebox.showerror("Error", "Select an item to edit.")
+            messagebox.showerror("Error", "Select an item first.")
             return
-
         item_id = int(selected[0])
-        details = self.db.get_item_details(item_id)
-        if not details:
-            messagebox.showerror("Error", "Item not found.")
-            return
+        item_name = self.tree.item(selected[0], "values")[0]
 
-        _item_id, current_name, current_price, current_weight, current_qty = details
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT COALESCE(sku,'') FROM items WHERE id = ?;", (item_id,))
-        row = cur.fetchone()
-        current_sku = row[0] if row else ""
+        win = tk.Toplevel(self)
+        win.title(f"Temporary Surcharges - {item_name}")
+        win.transient(self)
+        win.geometry("900x620")
+        win.minsize(780, 520)
 
-        dialog = tk.Toplevel(self)
-        dialog.title("Edit Item")
-        dialog.transient(self)
-        dialog.grab_set()
-        dialog.resizable(False, False)
+        form = ttk.LabelFrame(win, text="Add Temporary Product Surcharge", padding=12)
+        form.pack(fill="x", padx=12, pady=12)
+        reason_var = tk.StringVar(value="Tariff")
+        box_var = tk.StringVar(value="0.00")
+        unit_var = tk.StringVar(value="0.00")
+        start_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        end_var = tk.StringVar()
+        note_var = tk.StringVar()
+        ttk.Label(form, text="Reason:").grid(row=0,column=0,sticky="w",pady=5)
+        ttk.Combobox(form,textvariable=reason_var,values=("Tariff","Demurrage","Freight","Customs","Other"),width=20).grid(row=0,column=1,sticky="w",padx=8,pady=5)
+        ttk.Label(form, text="Box surcharge:").grid(row=0,column=2,sticky="w",pady=5)
+        ttk.Entry(form,textvariable=box_var,width=12).grid(row=0,column=3,sticky="w",padx=8,pady=5)
+        ttk.Label(form, text="Unit surcharge:").grid(row=0,column=4,sticky="w",pady=5)
+        ttk.Entry(form,textvariable=unit_var,width=12).grid(row=0,column=5,sticky="w",padx=8,pady=5)
+        ttk.Label(form, text="Start date:").grid(row=1,column=0,sticky="w",pady=5)
+        ttk.Entry(form,textvariable=start_var,width=14).grid(row=1,column=1,sticky="w",padx=8,pady=5)
+        ttk.Label(form, text="End date (optional):").grid(row=1,column=2,sticky="w",pady=5)
+        ttk.Entry(form,textvariable=end_var,width=14).grid(row=1,column=3,sticky="w",padx=8,pady=5)
+        ttk.Label(form, text="Note:").grid(row=2,column=0,sticky="w",pady=5)
+        ttk.Entry(form,textvariable=note_var).grid(row=2,column=1,columnspan=5,sticky="ew",padx=8,pady=5)
+        form.columnconfigure(5,weight=1)
 
-        frame = ttk.Frame(dialog, padding=16)
-        frame.pack(fill="both", expand=True)
+        table_box = ttk.LabelFrame(win, text="Surcharge History", padding=10)
+        table_box.pack(fill="both", expand=True, padx=12, pady=(0,12))
+        cols=("reason","box","unit","start","end","status","note","updated")
+        tree=ttk.Treeview(table_box,columns=cols,show="headings")
+        for c,title,w,anchor in [("reason","Reason",110,"w"),("box","Box",90,"e"),("unit","Unit",90,"e"),("start","Start",100,"center"),("end","End",100,"center"),("status","Status",90,"center"),("note","Note",220,"w"),("updated","Updated",145,"center")]:
+            tree.heading(c,text=title); tree.column(c,width=w,anchor=anchor)
+        tree.pack(fill="both",expand=True)
 
-        name_var = tk.StringVar(value=current_name)
-        sku_var = tk.StringVar(value=current_sku)
-        price_var = tk.StringVar(value=f"{float(current_price):.2f}")
-        weight_var = tk.StringVar(value=current_weight)
+        def refresh_rows():
+            for row in tree.get_children(): tree.delete(row)
+            today=datetime.now().strftime("%Y-%m-%d")
+            for sid,reason,box,unit,start,end,active,note,updated in self.db.list_item_surcharges(item_id):
+                currently_active = bool(active) and start <= today and (not end or end >= today)
+                status = "Active" if currently_active else ("Enabled" if active else "Inactive")
+                tree.insert("","end",iid=str(sid),values=(reason,money(box),money(unit),start,end or "—",status,note,updated))
 
-        ttk.Label(frame, text="Item Name:", width=16).grid(row=0, column=0, sticky="w", pady=6)
-        name_entry = ttk.Entry(frame, textvariable=name_var, width=36)
-        name_entry.grid(row=0, column=1, sticky="ew", pady=6)
-
-        ttk.Label(frame, text="SKU:", width=16).grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=sku_var, width=36).grid(row=1, column=1, sticky="ew", pady=6)
-
-        ttk.Label(frame, text="Price:", width=16).grid(row=2, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=price_var, width=18).grid(row=2, column=1, sticky="w", pady=6)
-
-        ttk.Label(frame, text="Weight:", width=16).grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=weight_var, width=36).grid(row=3, column=1, sticky="ew", pady=6)
-
-        ttk.Label(frame, text=f"Current stock: {current_qty}", foreground="#666").grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(4, 10)
-        )
-
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
-
-        def save_changes():
+        def save_surcharge():
             try:
-                self.db.update_item(
-                    item_id,
-                    name_var.get(),
-                    sku_var.get(),
-                    price_var.get(),
-                    weight_var.get()
-                )
-                dialog.destroy()
-                self.refresh_all()
-                messagebox.showinfo("Updated", "Item details updated.")
-            except Exception as e:
-                messagebox.showerror("Error", str(e), parent=dialog)
+                self.db.save_item_surcharge(item_id,reason_var.get(),box_var.get(),unit_var.get(),start_var.get(),end_var.get(),note_var.get())
+                refresh_rows(); messagebox.showinfo("Saved","Temporary surcharge saved.",parent=win)
+            except Exception as exc: messagebox.showerror("Error",str(exc),parent=win)
 
-        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
-        ttk.Button(buttons, text="Save Changes", style="Big.TButton", command=save_changes).pack(side="right", padx=(0, 8))
+        def set_active(active):
+            selected_row=tree.selection()
+            if not selected_row:
+                messagebox.showerror("Error","Select a surcharge first.",parent=win); return
+            self.db.set_item_surcharge_active(int(selected_row[0]),active); refresh_rows()
 
-        dialog.bind("<Return>", lambda event: save_changes())
-        dialog.bind("<Escape>", lambda event: dialog.destroy())
-        name_entry.focus_set()
-
-        dialog.update_idletasks()
-        x = self.winfo_rootx() + max((self.winfo_width() - dialog.winfo_width()) // 2, 0)
-        y = self.winfo_rooty() + max((self.winfo_height() - dialog.winfo_height()) // 2, 0)
-        dialog.geometry(f"+{x}+{y}")
+        buttons=ttk.Frame(win,padding=(12,0,12,12)); buttons.pack(fill="x")
+        ttk.Button(buttons,text="Save Surcharge",style="Big.TButton",command=save_surcharge).pack(side="left")
+        ttk.Button(buttons,text="Activate Selected",command=lambda:set_active(True)).pack(side="left",padx=8)
+        ttk.Button(buttons,text="Deactivate Selected",command=lambda:set_active(False)).pack(side="left")
+        ttk.Button(buttons,text="Close",command=win.destroy).pack(side="right")
+        refresh_rows()
 
     def on_delete_item(self):
         selected = self.tree.selection()
@@ -1429,70 +1775,22 @@ class App(tk.Tk):
             messagebox.showerror("Error", str(e))
 
     def refresh_inventory(self):
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
-        rows = self.db.list_items(self.search_var.get())
-        for (
-            item_id, name, sku, price, weight, qty,
-            sold_0_30, sold_31_60, sold_61_90, updated_at
-        ) in rows:
-            price_display = money(price)
-            value_display = money(price * qty)
-
-            # Weighted 90-day demand rate. Recent sales influence the forecast most.
-            recent_daily = sold_0_30 / 30.0
-            middle_daily = sold_31_60 / 30.0
-            older_daily = sold_61_90 / 30.0
-            average_daily_usage = (
-                recent_daily * 0.60
-                + middle_daily * 0.30
-                + older_daily * 0.10
-            )
-
-            if qty <= 0:
-                days_display = "0.0"
-                priority = "Out of Stock"
-                tag = "critical"
-            elif average_daily_usage <= 0:
-                days_display = "—"
-                priority = "No recent sales"
-                tag = ""
+        for row in self.tree.get_children(): self.tree.delete(row)
+        for item_id,name,sku,box_price,unit_price,upb,weight,qty,s0,s1,s2,updated in self.db.list_items(self.search_var.get()):
+            full_boxes = qty // upb; loose_units = qty % upb
+            inventory_value = full_boxes * box_price + loose_units * unit_price
+            avg=(s0/30)*.60+(s1/30)*.30+(s2/30)*.10
+            if qty<=0: days="0.0"; priority="Out of Stock"; tag="critical"
+            elif avg<=0: days="—"; priority="No recent sales"; tag=""
             else:
-                days_on_hand = qty / average_daily_usage
-                days_display = f"{days_on_hand:.1f}"
-
-                if days_on_hand < 14:
-                    priority = "Critical"
-                    tag = "critical"
-                elif days_on_hand < 30:
-                    priority = "Low"
-                    tag = "low"
-                elif days_on_hand <= 60:
-                    priority = "Watch"
-                    tag = "watch"
-                else:
-                    priority = "Healthy"
-                    tag = ""
-
-            daily_usage_display = (
-                f"{average_daily_usage:.2f}"
-                if average_daily_usage > 0
-                else "0.00"
-            )
-
-            self.tree.insert(
-                "", "end", iid=str(item_id),
-                values=(
-                    name, sku, weight, price_display, qty, value_display,
-                    daily_usage_display, days_display, priority, updated_at
-                ),
-                tags=(tag,) if tag else ()
-            )
-
+                doh=qty/avg; days=f"{doh:.1f}"
+                if doh<14: priority="Critical"; tag="critical"
+                elif doh<30: priority="Low"; tag="low"
+                elif doh<=60: priority="Watch"; tag="watch"
+                else: priority="Healthy"; tag=""
+            self.tree.insert("","end",iid=str(item_id),values=(name,sku,weight,upb,money(box_price),money(unit_price),qty,full_boxes,loose_units,money(inventory_value),f"{avg:.2f}",days,priority,updated),tags=(tag,) if tag else ())
         self._refresh_item_dropdowns()
 
-    # ---------- Shipment Tab ----------
     def _build_shipment_tab(self):
         box = ttk.LabelFrame(self.tab_shipment, text="Add Shipment (Increase Stock)", padding=12)
         box.pack(fill="x", pady=(0, 10))
@@ -1501,6 +1799,7 @@ class App(tk.Tk):
         self.ship_qty = tk.StringVar()
         self.ship_note = tk.StringVar()
         self.ship_item = tk.StringVar()
+        self.ship_type = tk.StringVar(value="box")
 
         r1 = ttk.Frame(box); r1.pack(fill="x", pady=6)
         ttk.Label(r1, text="Shipment #:", width=18).pack(side="left")
@@ -1512,6 +1811,7 @@ class App(tk.Tk):
         self.ship_item_cb.pack(side="left", padx=8)
         ttk.Label(r2, text="Qty:").pack(side="left", padx=(12, 0))
         ttk.Entry(r2, textvariable=self.ship_qty, width=10).pack(side="left", padx=8)
+        ttk.Combobox(r2,textvariable=self.ship_type,state="readonly",values=("box","unit"),width=8).pack(side="left",padx=4)
         ttk.Button(r2, text="Add Line", style="Big.TButton", command=self.on_add_shipment_line).pack(side="left", padx=(8, 0))
 
         r3 = ttk.Frame(box); r3.pack(fill="x", pady=6)
@@ -1521,12 +1821,16 @@ class App(tk.Tk):
         lines_box = ttk.LabelFrame(self.tab_shipment, text="Shipment Lines To Save", padding=12)
         lines_box.pack(fill="both", expand=True, pady=(0, 10))
 
-        cols = ("item", "qty")
+        cols = ("item", "qty", "type", "units")
         self.ship_lines_tree = ttk.Treeview(lines_box, columns=cols, show="headings", height=8)
         self.ship_lines_tree.heading("item", text="Item")
-        self.ship_lines_tree.heading("qty", text="Quantity Received")
+        self.ship_lines_tree.heading("qty", text="Quantity")
+        self.ship_lines_tree.heading("type", text="Received As")
+        self.ship_lines_tree.heading("units", text="Units Added")
         self.ship_lines_tree.column("item", width=450)
-        self.ship_lines_tree.column("qty", width=150, anchor="center")
+        self.ship_lines_tree.column("qty", width=100, anchor="center")
+        self.ship_lines_tree.column("type", width=110, anchor="center")
+        self.ship_lines_tree.column("units", width=110, anchor="center")
 
         vsb = ttk.Scrollbar(lines_box, orient="vertical", command=self.ship_lines_tree.yview)
         self.ship_lines_tree.configure(yscrollcommand=vsb.set)
@@ -1544,20 +1848,11 @@ class App(tk.Tk):
 
     def on_add_shipment_line(self):
         try:
-            item_name = self.ship_item.get()
-            item_id = self._selected_item_id(item_name)
-            qty = int(self.ship_qty.get())
-
-            if qty <= 0:
-                raise ValueError("Quantity must be > 0.")
-
-            self.shipment_lines.append((item_id, item_name, qty))
-
-            self.ship_qty.set("")
-            self.refresh_shipment_lines()
-
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            item_name=self.ship_item.get(); item_id=self._selected_item_id(item_name); qty=int(self.ship_qty.get()); typ=self.ship_type.get()
+            if qty<=0: raise ValueError("Quantity must be > 0.")
+            item=self.db.get_item_details(item_id); units=qty*(item[4] if typ=='box' else 1)
+            self.shipment_lines.append((item_id,item_name,qty,typ,units)); self.ship_qty.set(""); self.refresh_shipment_lines()
+        except Exception as e: messagebox.showerror("Error",str(e))
 
     def on_save_shipment(self):
         try:
@@ -1569,8 +1864,8 @@ class App(tk.Tk):
             if not self.shipment_lines:
                 raise ValueError("Add at least one item to the shipment list.")
 
-            for item_id, item_name, qty in self.shipment_lines:
-                self.db.record_shipment(ref, item_id, qty, self.ship_note.get())
+            for item_id, item_name, qty, typ, units in self.shipment_lines:
+                self.db.record_shipment(ref, item_id, qty, typ, self.ship_note.get())
 
             self.shipment_lines.clear()
             self.ship_ref.set("")
@@ -1599,13 +1894,9 @@ class App(tk.Tk):
         self.refresh_shipment_lines()
 
     def refresh_shipment_lines(self):
-        for row in self.ship_lines_tree.get_children():
-            self.ship_lines_tree.delete(row)
+        for row in self.ship_lines_tree.get_children(): self.ship_lines_tree.delete(row)
+        for _id,name,qty,typ,units in self.shipment_lines: self.ship_lines_tree.insert("","end",values=(name,qty,typ.title(),units))
 
-        for item_id, item_name, qty in self.shipment_lines:
-            self.ship_lines_tree.insert("", "end", values=(item_name, qty))
-
-    # ---------- Invoice Tab ----------
     def _build_invoice_tab(self):
         self.inv_ref = tk.StringVar()
         self.inv_store_name = tk.StringVar()
@@ -1616,6 +1907,7 @@ class App(tk.Tk):
         self.inv_order_notes = tk.StringVar()
         self.inv_qty = tk.StringVar()
         self.inv_item = tk.StringVar()
+        self.inv_sale_type = tk.StringVar(value="box")
 
         # Two-column workspace. Only the item list expands; the footer remains visible.
         workspace = ttk.Frame(self.tab_invoice)
@@ -1683,7 +1975,8 @@ class App(tk.Tk):
         ttk.Label(add_line, text="Qty:").grid(row=0, column=2, sticky="w", padx=(8, 0))
         qty_entry = ttk.Entry(add_line, textvariable=self.inv_qty, width=9)
         qty_entry.grid(row=0, column=3, padx=8)
-        ttk.Button(add_line, text="Add Line", style="Big.TButton", command=self.on_add_invoice_line).grid(row=0, column=4)
+        ttk.Combobox(add_line,textvariable=self.inv_sale_type,state="readonly",values=("box","unit"),width=8).grid(row=0,column=4,padx=4)
+        ttk.Button(add_line, text="Add Line", style="Big.TButton", command=self.on_add_invoice_line).grid(row=0, column=5)
         qty_entry.bind("<Return>", lambda event: self.on_add_invoice_line())
 
         lines_box = ttk.LabelFrame(right, text="Invoice Lines", padding=10)
@@ -1691,15 +1984,25 @@ class App(tk.Tk):
         lines_box.rowconfigure(0, weight=1)
         lines_box.columnconfigure(0, weight=1)
 
-        cols = ("item", "qty", "price", "line_total")
+        cols = ("item", "qty", "sale_type", "units", "base_price", "surcharge", "price", "pricing", "line_total")
         self.inv_lines_tree = ttk.Treeview(lines_box, columns=cols, show="headings", height=12)
         self.inv_lines_tree.heading("item", text="Item")
         self.inv_lines_tree.heading("qty", text="Quantity")
-        self.inv_lines_tree.heading("price", text="Unit Price")
+        self.inv_lines_tree.heading("sale_type", text="Sold As")
+        self.inv_lines_tree.heading("units", text="Stock Units")
+        self.inv_lines_tree.heading("base_price", text="Base Price")
+        self.inv_lines_tree.heading("surcharge", text="Surcharge")
+        self.inv_lines_tree.heading("price", text="Charged Price")
+        self.inv_lines_tree.heading("pricing", text="Pricing")
         self.inv_lines_tree.heading("line_total", text="Line Total")
         self.inv_lines_tree.column("item", width=360, anchor="w")
         self.inv_lines_tree.column("qty", width=90, anchor="center", stretch=False)
+        self.inv_lines_tree.column("sale_type", width=90, anchor="center", stretch=False)
+        self.inv_lines_tree.column("units", width=90, anchor="center", stretch=False)
+        self.inv_lines_tree.column("base_price", width=100, anchor="e", stretch=False)
+        self.inv_lines_tree.column("surcharge", width=130, anchor="e", stretch=False)
         self.inv_lines_tree.column("price", width=110, anchor="e", stretch=False)
+        self.inv_lines_tree.column("pricing", width=95, anchor="center", stretch=False)
         self.inv_lines_tree.column("line_total", width=120, anchor="e", stretch=False)
 
         vsb = ttk.Scrollbar(lines_box, orient="vertical", command=self.inv_lines_tree.yview)
@@ -1768,43 +2071,25 @@ class App(tk.Tk):
         # If the typed store name exactly matches a saved customer, fill in details.
         self.on_customer_selected()
 
+    def _current_invoice_customer_id(self):
+        customer = self.db.get_customer_by_store_name(self.inv_store_name.get())
+        return customer[0] if customer else None
+
     def on_add_invoice_line(self):
         try:
-            item_name = self.inv_item.get()
-            item_id = self._selected_item_id(item_name)
-            qty = int(self.inv_qty.get())
-
-            if qty <= 0:
-                raise ValueError("Quantity must be > 0.")
-
-            self.invoice_lines.append((item_id, item_name, qty))
-            self.inv_qty.set("")
-            self.refresh_invoice_lines()
-
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            item_name=self.inv_item.get(); item_id=self._selected_item_id(item_name); qty=int(self.inv_qty.get()); sale_type=self.inv_sale_type.get()
+            if qty<=0: raise ValueError("Quantity must be > 0.")
+            customer=self.db.get_customer_by_store_name(self.inv_store_name.get().strip()); customer_id=customer[0] if customer else None
+            base_price,surcharge_amount,charged_price,pricing_type,surcharge_reason = self.db.get_invoice_price_details(customer_id,item_id,sale_type)
+            item=self.db.get_item_details(item_id); upb=item[4]; unit_qty=qty*(upb if sale_type=='box' else 1)
+            self.invoice_lines.append((item_id,item_name,qty,sale_type,unit_qty,upb,base_price,surcharge_amount,charged_price,pricing_type,surcharge_reason)); self.inv_qty.set(""); self.refresh_invoice_lines()
+        except Exception as e: messagebox.showerror("Error",str(e))
 
     def _invoice_totals(self):
-        subtotal = 0.0
-        for item_id, _item_name, qty in self.invoice_lines:
-            item = self.db.get_item_details(item_id)
-            price = item[2] if item else 0
-            subtotal += price * qty
-
-        discount_percent = float(self.inv_discount.get() or 0)
-        credit = float(self.inv_credit.get() or 0)
-
-        if discount_percent < 0:
-            raise ValueError("Discount percent must be >= 0.")
-        if credit < 0:
-            raise ValueError("Credit must be >= 0.")
-
-        discount_amount = subtotal * (discount_percent / 100.0)
-        total = subtotal - discount_amount - credit
-        if total < 0:
-            total = 0.0
-
-        return subtotal, discount_percent, discount_amount, credit, total
+        subtotal=sum(price*qty for _id,_name,qty,_type,_units,_upb,_base,_surcharge,price,_pricing,_reason in self.invoice_lines)
+        discount_percent=float(self.inv_discount.get() or 0); credit=float(self.inv_credit.get() or 0)
+        if discount_percent<0 or credit<0: raise ValueError("Discount and credit must be >= 0.")
+        discount_amount=subtotal*(discount_percent/100); return subtotal,discount_percent,discount_amount,credit,max(0,subtotal-discount_amount-credit)
 
     def on_save_invoice(self):
         try:
@@ -1820,15 +2105,15 @@ class App(tk.Tk):
             # subtract more stock than is available.
             totals = {}
             names = {}
-            for item_id, item_name, qty in self.invoice_lines:
-                totals[item_id] = totals.get(item_id, 0) + qty
+            for item_id, item_name, qty, sale_type, unit_qty, upb, base_price, surcharge_amount, unit_price, pricing_type, surcharge_reason in self.invoice_lines:
+                totals[item_id] = totals.get(item_id, 0) + unit_qty
                 names[item_id] = item_name
 
             for item_id, total_qty in totals.items():
                 item = self.db.get_item_details(item_id)
                 if not item:
                     raise ValueError(f"Item not found: {names[item_id]}")
-                current_stock = item[4]
+                current_stock = item[6]
                 if total_qty > current_stock:
                     raise ValueError(
                         f"Not enough stock for {names[item_id]}. "
@@ -1866,8 +2151,8 @@ class App(tk.Tk):
                     f"Account credit entered is {money(credit)}, but {store_name} only has {money(available_credit)} available."
                 )
 
-            for item_id, item_name, qty in self.invoice_lines:
-                self.db.record_invoice(ref, item_id, qty, notes)
+            for item_id, item_name, qty, sale_type, unit_qty, upb, base_price, surcharge_amount, unit_price, pricing_type, surcharge_reason in self.invoice_lines:
+                self.db.record_invoice(ref, item_id, unit_qty, notes)
 
             printable_path = self.create_printable_invoice(
                 ref, printable_lines, self.inv_store_name.get(), self.inv_address.get(),
@@ -1889,10 +2174,8 @@ class App(tk.Tk):
                 printable_path
             )
 
-            for item_id, item_name, qty in printable_lines:
-                item = self.db.get_item_details(item_id)
-                unit_price = item[2] if item else 0
-                self.db.save_invoice_line(invoice_id, item_id, item_name, qty, unit_price)
+            for item_id, item_name, qty, sale_type, unit_qty, upb, base_price, surcharge_amount, unit_price, pricing_type, surcharge_reason in printable_lines:
+                self.db.save_invoice_line(invoice_id, item_id, item_name, qty, sale_type, unit_qty, upb, base_price, surcharge_amount, unit_price, surcharge_reason)
 
             if credit > 0:
                 self.db.adjust_customer_credit(customer_id, -credit, "APPLIED", f"Invoice {ref}", "Account credit applied to invoice")
@@ -1932,19 +2215,27 @@ class App(tk.Tk):
         path = os.path.join(invoice_dir, file_name)
 
         rows_html = []
-        for index, (item_id, item_name, qty) in enumerate(lines, start=1):
-            item = self.db.get_item_details(item_id)
-            price = item[2] if item else 0
+        for index, (item_id, item_name, qty, sale_type, unit_qty, upb, base_price, surcharge_amount, price, _pricing_type, _surcharge_reason) in enumerate(lines, start=1):
             line_total = price * qty
             rows_html.append(
                 "<tr>"
                 f"<td>{index}</td>"
                 f"<td>{escape(item_name)}</td>"
-                f"<td class='qty'>{qty}</td>"
-                f"<td class='money'>{money(price)}</td>"
-                f"<td class='money'>{money(line_total)}</td>"
+                f"<td class='qty'>{qty} {escape(sale_type)}(s)</td>"
+                f"<td class='money'>{money(base_price)}</td>"
+                f"<td class='money'>{money(base_price * qty)}</td>"
                 "</tr>"
             )
+            if surcharge_amount > 0:
+                rows_html.append(
+                    "<tr>"
+                    "<td></td>"
+                    f"<td>Temporary {escape(_surcharge_reason or 'product')} surcharge</td>"
+                    f"<td class='qty'>{qty}</td>"
+                    f"<td class='money'>{money(surcharge_amount)}</td>"
+                    f"<td class='money'>{money(surcharge_amount * qty)}</td>"
+                    "</tr>"
+                )
 
         customer_html = f"""
         <div class="customer">
@@ -2054,9 +2345,8 @@ class App(tk.Tk):
             subtotal, _discount_percent, discount_amount, credit, total = self._invoice_totals()
         except (ValueError, tk.TclError):
             subtotal = 0.0
-            for item_id, _item_name, qty in self.invoice_lines:
-                item = self.db.get_item_details(item_id)
-                subtotal += (item[2] if item else 0) * qty
+            for _item_id, _item_name, qty, _sale_type, _unit_qty, _upb, _base_price, _surcharge, unit_price, _pricing_type, _reason in self.invoice_lines:
+                subtotal += unit_price * qty
             discount_amount = 0.0
             credit = 0.0
             total = subtotal
@@ -2067,17 +2357,17 @@ class App(tk.Tk):
         self.inv_total_label.config(text=f"Total: {money(total)}")
 
     def refresh_invoice_lines(self):
-        for row in self.inv_lines_tree.get_children():
-            self.inv_lines_tree.delete(row)
-
-        for item_id, item_name, qty in self.invoice_lines:
-            item = self.db.get_item_details(item_id)
-            price = item[2] if item else 0
-            self.inv_lines_tree.insert("", "end", values=(item_name, qty, money(price), money(price * qty)))
-
+        for row in self.inv_lines_tree.get_children(): self.inv_lines_tree.delete(row)
+        for _id,name,qty,sale_type,unit_qty,_upb,base_price,surcharge_amount,price,pricing,surcharge_reason in self.invoice_lines:
+            surcharge_display = money(surcharge_amount)
+            if surcharge_amount > 0 and surcharge_reason:
+                surcharge_display += f" ({surcharge_reason})"
+            self.inv_lines_tree.insert("","end",values=(
+                name,qty,sale_type.title(),unit_qty,money(base_price),surcharge_display,
+                money(price),pricing,money(price*qty)
+            ))
         self._refresh_invoice_total_labels()
 
-    # ---------- Customer Management Tab ----------
     def _build_customer_management_tab(self):
         self.customer_selected_id = None
 
@@ -2141,6 +2431,31 @@ class App(tk.Tk):
         ttk.Button(buttons, text="Delete", style="Big.TButton", command=self.on_delete_managed_customer).pack(side="left")
         ttk.Button(buttons, text="Clear Form", style="Big.TButton", command=self.clear_customer_form).pack(side="left", padx=8)
 
+        pricing_box = ttk.LabelFrame(right, text="Special Pricing", padding=8)
+        pricing_box.pack(fill="x", pady=(10, 0))
+        pricing_box.columnconfigure(1, weight=1)
+        self.special_price_item_var = tk.StringVar()
+        self.special_box_price_var = tk.StringVar()
+        self.special_unit_price_var = tk.StringVar()
+        self.special_price_type_var = tk.StringVar(value="box")
+        ttk.Label(pricing_box, text="Item:").grid(row=0, column=0, sticky="w", pady=4)
+        self.special_price_item_cb = ttk.Combobox(pricing_box, textvariable=self.special_price_item_var, state="readonly")
+        self.special_price_item_cb.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
+        ttk.Label(pricing_box, text="Special Box Price:").grid(row=1,column=0,sticky="w",pady=4)
+        ttk.Entry(pricing_box,textvariable=self.special_box_price_var,width=14).grid(row=1,column=1,sticky="w",padx=(8,0),pady=4)
+        ttk.Label(pricing_box, text="Special Unit Price:").grid(row=2,column=0,sticky="w",pady=4)
+        ttk.Entry(pricing_box,textvariable=self.special_unit_price_var,width=14).grid(row=2,column=1,sticky="w",padx=(8,0),pady=4)
+        price_buttons = ttk.Frame(pricing_box)
+        price_buttons.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 4))
+        ttk.Button(price_buttons, text="Save Special Price", command=self.on_save_special_price).pack(side="left")
+        ttk.Button(price_buttons, text="Remove Special Price", command=self.on_remove_special_price).pack(side="left", padx=8)
+        sp_cols = ("item", "box_standard", "box_special", "unit_standard", "unit_special")
+        self.special_prices_tree = ttk.Treeview(pricing_box, columns=sp_cols, show="headings", height=5)
+        for c,title,width,anchor in [("item","Item",150,"w"),("box_standard","Box Std",80,"e"),("box_special","Box Special",85,"e"),("unit_standard","Unit Std",80,"e"),("unit_special","Unit Special",85,"e")]:
+            self.special_prices_tree.heading(c, text=title); self.special_prices_tree.column(c, width=width, anchor=anchor)
+        self.special_prices_tree.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        self.special_prices_tree.bind("<<TreeviewSelect>>", self.on_special_price_selected)
+
         credit_box = ttk.LabelFrame(right, text="Account Credit History", padding=8)
         credit_box.pack(fill="both", expand=True, pady=(10, 0))
         credit_cols = ("date", "type", "amount", "reference")
@@ -2191,6 +2506,10 @@ class App(tk.Tk):
         self.manage_address_text.delete("1.0", "end")
         for row in self.customer_history_tree.get_children():
             self.customer_history_tree.delete(row)
+        for row in self.special_prices_tree.get_children():
+            self.special_prices_tree.delete(row)
+        self.special_box_price_var.set("")
+        self.special_unit_price_var.set("")
         for selected in self.customer_tree.selection():
             self.customer_tree.selection_remove(selected)
 
@@ -2206,6 +2525,7 @@ class App(tk.Tk):
         self.manage_phone_var.set(values[2])
         self.refresh_customer_invoice_history(self.customer_selected_id)
         self.refresh_customer_credit_history(self.customer_selected_id)
+        self.refresh_customer_special_prices(self.customer_selected_id)
 
     def refresh_customer_invoice_history(self, customer_id):
         for row in self.customer_history_tree.get_children():
@@ -2227,6 +2547,45 @@ class App(tk.Tk):
             display_amount = money(abs(amount))
             display_amount = ("-" if amount < 0 else "+") + display_amount
             self.customer_credit_tree.insert("", "end", values=(created_at, entry_type.title(), display_amount, reference))
+
+    def refresh_special_price_item_choices(self):
+        if not hasattr(self, "special_price_item_cb"):
+            return
+        names = [row[1] for row in self.db.list_items("")]
+        self.special_price_item_cb["values"] = names
+        if self.special_price_item_var.get() not in names:
+            self.special_price_item_var.set(names[0] if names else "")
+
+    def refresh_customer_special_prices(self, customer_id):
+        if not hasattr(self,"special_prices_tree"): return
+        for row in self.special_prices_tree.get_children(): self.special_prices_tree.delete(row)
+        if customer_id is None: return
+        for item_id,name,box_std,unit_std,box_sp,unit_sp,_updated in self.db.list_customer_special_prices(customer_id):
+            self.special_prices_tree.insert("","end",iid=str(item_id),values=(name,money(box_std),money(box_sp),money(unit_std),money(unit_sp) if unit_sp is not None else "—"))
+
+    def on_special_price_selected(self,event=None):
+        selected=self.special_prices_tree.selection()
+        if not selected:return
+        v=self.special_prices_tree.item(selected[0],"values"); self.special_price_item_var.set(v[0]); self.special_box_price_var.set(v[2].replace("$","").replace(",","")); self.special_unit_price_var.set("" if v[4]=="—" else v[4].replace("$","").replace(",",""))
+
+    def on_save_special_price(self):
+        try:
+            if self.customer_selected_id is None: raise ValueError("Select a customer first.")
+            item_id=self._selected_item_id(self.special_price_item_var.get())
+            if self.special_box_price_var.get().strip(): self.db.set_customer_special_price(self.customer_selected_id,item_id,"box",self.special_box_price_var.get())
+            if self.special_unit_price_var.get().strip(): self.db.set_customer_special_price(self.customer_selected_id,item_id,"unit",self.special_unit_price_var.get())
+            self.refresh_customer_special_prices(self.customer_selected_id); messagebox.showinfo("Saved","Customer-specific box/unit pricing saved.")
+        except Exception as e: messagebox.showerror("Error",str(e))
+
+    def on_remove_special_price(self):
+        try:
+            if self.customer_selected_id is None: raise ValueError("Select a customer first.")
+            item_id=self._selected_item_id(self.special_price_item_var.get())
+            choice=messagebox.askyesnocancel("Remove Special Price", "Yes removes BOX pricing.\nNo removes UNIT pricing.\nCancel does nothing.")
+            if choice is None:return
+            self.db.remove_customer_special_price(self.customer_selected_id,item_id,"box" if choice else "unit")
+            self.refresh_customer_special_prices(self.customer_selected_id)
+        except Exception as e: messagebox.showerror("Error",str(e))
 
     def on_add_managed_customer(self):
         try:
@@ -2360,9 +2719,9 @@ class App(tk.Tk):
         for row in self.refund_available_tree.get_children(): self.refund_available_tree.delete(row)
         invoice_id = self.refund_invoice_lookup.get(self.refund_invoice_var.get())
         if not invoice_id: return
-        for line_id, item_id, item_name, sold_qty, refunded_qty, unit_price in self.db.get_refundable_invoice_lines(invoice_id):
+        for line_id, item_id, item_name, sold_qty, refunded_qty, unit_price, sale_type, units_per_box in self.db.get_refundable_invoice_lines(invoice_id):
             available = sold_qty - refunded_qty
-            self.refund_available_tree.insert("", "end", iid=str(line_id), values=(item_name, sold_qty, refunded_qty, available, money(unit_price)))
+            self.refund_available_tree.insert("", "end", iid=str(line_id), values=(f"{item_name} ({sale_type})", sold_qty, refunded_qty, available, money(unit_price)))
 
     def on_add_refund_line(self):
         try:
@@ -2536,8 +2895,11 @@ class App(tk.Tk):
         lines_tree.column("line_total", width=130, anchor="e")
         lines_tree.pack(fill="both", expand=True)
 
-        for item_name, qty, unit_price, line_total in self.db.get_invoice_lines(invoice_id):
-            lines_tree.insert("", "end", values=(item_name, qty, money(unit_price), money(line_total)))
+        for item_name, qty, sale_type, base_price, surcharge_amount, surcharge_reason, unit_price, line_total in self.db.get_invoice_lines(invoice_id):
+            price_text = money(unit_price)
+            if surcharge_amount > 0:
+                price_text += f" (includes {money(surcharge_amount)} surcharge)"
+            lines_tree.insert("", "end", values=(item_name, f"{qty} {sale_type}(s)", price_text, money(line_total)))
 
         totals_box = ttk.LabelFrame(win, text="Totals / Payment", padding=12)
         totals_box.pack(fill="x", padx=12, pady=(0, 12))
@@ -2692,7 +3054,7 @@ class App(tk.Tk):
         for row in self.db.list_monthly_statements():
             (
                 _id, year, month, period_label, invoice_count, open_count, closed_count, void_count,
-                _subtotal, _discount, _credit, total_sales, paid_total, open_total, _void_total,
+                _subtotal, _discount, _credit, _surcharge, total_sales, paid_total, open_total, _void_total,
                 _printable_path, updated_at
             ) = row
             self.statements_tree.insert(
@@ -2741,7 +3103,7 @@ class App(tk.Tk):
         if not statement:
             messagebox.showerror("Error", "Statement was not found.")
             return
-        printable_path = statement[15]
+        printable_path = statement[16]
         if printable_path and os.path.exists(printable_path):
             webbrowser.open(f"file://{os.path.abspath(printable_path)}")
         else:
@@ -2810,6 +3172,7 @@ class App(tk.Tk):
         <tr><th>Subtotal</th><td class="money">{money(data['subtotal'])}</td></tr>
         <tr><th>Discounts</th><td class="money">- {money(data['discount_amount'])}</td></tr>
         <tr><th>Credits</th><td class="money">- {money(data['credit'])}</td></tr>
+        <tr><th>Temporary surcharges</th><td class="money">{money(data['surcharge_amount'])}</td></tr>
         <tr><th>Total sales</th><td class="money"><strong>{money(data['total_sales'])}</strong></td></tr>
         <tr><th>Open / Closed / Void</th><td>{data['open_count']} open, {data['closed_count']} closed, {data['void_count']} void</td></tr>
     </table>
@@ -2886,6 +3249,7 @@ class App(tk.Tk):
         <tr><th>Subtotal</th><td class="money">{money(data['subtotal'])}</td></tr>
         <tr><th>Discounts</th><td class="money">- {money(data['discount_amount'])}</td></tr>
         <tr><th>Credits</th><td class="money">- {money(data['credit'])}</td></tr>
+        <tr><th>Temporary surcharges</th><td class="money">{money(data['surcharge_amount'])}</td></tr>
         <tr><th>Total sales</th><td class="money"><strong>{money(data['total_sales'])}</strong></td></tr>
         <tr><th>Paid</th><td class="money">{money(data['paid_total'])}</td></tr>
         <tr><th>Open balance</th><td class="money">{money(data['open_total'])}</td></tr>
@@ -2984,6 +3348,7 @@ class App(tk.Tk):
         self.refresh_statements()
         self.refresh_customer_management()
         self.refresh_customer_dropdowns()
+        self.refresh_special_price_item_choices()
         self._update_hints()
 
     def _refresh_item_dropdowns(self):
