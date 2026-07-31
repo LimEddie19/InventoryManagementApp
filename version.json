@@ -1,0 +1,14 @@
+{
+    "version": "1.0.0",
+    "notes": [
+        "Initial public release",
+        "Inventory management",
+        "Shipment management",
+        "Customer accounts",
+        "Refund system",
+        "Transactions",
+        "Monthly & yearly statements",
+        "Chromebook support"
+    ],
+    "release_url": "https://github.com/LimEddie19/InventoryManagementApp/releases/latest"
+}
