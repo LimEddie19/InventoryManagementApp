@@ -111,6 +111,8 @@ Install dependencies and build using PyInstaller:
 pip install pyinstaller
 ```
 
+Change depending on source file name (Placeholder: stalk.py)
+
 ```
 pyinstaller --onefile --windowed --name Stalk stalk.py
 ```
