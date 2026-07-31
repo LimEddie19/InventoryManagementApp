@@ -4,11 +4,22 @@ import csv
 import shutil
 import sqlite3
 import webbrowser
+import json
+import urllib.request
+import urllib.error
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime
 from html import escape
 
+
+APP_NAME = "Stalk"
+APP_VERSION = "1.0.0"
+
+# GitHub-hosted release metadata used by Help > Check for Updates.
+UPDATE_INFO_URL = (
+    "https://raw.githubusercontent.com/LimEddie19/InventoryManagementApp/main/version.json"
+)
 
 DB_FILE = "inventory.db"
 
@@ -1021,6 +1032,8 @@ class App(tk.Tk):
         menu_bar.add_cascade(label="Tools", menu=tools_menu)
 
         help_menu = tk.Menu(menu_bar, tearoff=False)
+        help_menu.add_command(label="Check for Updates...", command=self.check_for_updates)
+        help_menu.add_separator()
         help_menu.add_command(label="About", command=self.show_about)
         menu_bar.add_cascade(label="Help", menu=help_menu)
 
@@ -1101,12 +1114,96 @@ class App(tk.Tk):
                 pass
             messagebox.showerror("Restore Error", f"Could not restore the database.\n\n{exc}")
 
+    @staticmethod
+    def _version_tuple(version):
+        """Convert a version such as 1.2.3 into a comparable integer tuple."""
+        cleaned = str(version).strip().lstrip("vV")
+        parts = cleaned.split(".")
+        values = []
+        for part in parts:
+            match = re.match(r"(\d+)", part)
+            values.append(int(match.group(1)) if match else 0)
+        while len(values) < 3:
+            values.append(0)
+        return tuple(values)
+
+    def check_for_updates(self):
+        """Check a small JSON file in the GitHub repository for a newer release."""
+        if "USERNAME/REPOSITORY" in UPDATE_INFO_URL:
+            messagebox.showwarning(
+                "Update Check Not Configured",
+                "The GitHub update URL has not been configured yet.\n\n"
+                "Edit UPDATE_INFO_URL near the top of the Python source file.",
+            )
+            return
+
+        try:
+            request = urllib.request.Request(
+                UPDATE_INFO_URL,
+                headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                update_info = json.loads(response.read().decode("utf-8"))
+
+            latest_version = str(update_info.get("version", "")).strip()
+            if not latest_version:
+                raise ValueError("The update file does not contain a version.")
+
+            notes = update_info.get("notes", [])
+            if isinstance(notes, list):
+                notes_text = "\n".join(f"• {note}" for note in notes)
+            else:
+                notes_text = str(notes).strip()
+
+            release_url = str(update_info.get("release_url", "")).strip()
+
+            if self._version_tuple(latest_version) > self._version_tuple(APP_VERSION):
+                details = (
+                    f"A new version of {APP_NAME} is available.\n\n"
+                    f"Installed: {APP_VERSION}\n"
+                    f"Latest: {latest_version}"
+                )
+                if notes_text:
+                    details += f"\n\nWhat's new:\n{notes_text}"
+                details += "\n\nOpen the GitHub release page?"
+
+                if messagebox.askyesno("Update Available", details):
+                    if release_url:
+                        webbrowser.open(release_url)
+                    else:
+                        messagebox.showinfo(
+                            "Release Link Missing",
+                            "The update was found, but version.json does not contain a release_url.",
+                        )
+            else:
+                messagebox.showinfo(
+                    "Stalk Is Up to Date",
+                    f"You are running the latest version.\n\nVersion {APP_VERSION}",
+                )
+
+        except (urllib.error.URLError, TimeoutError):
+            messagebox.showerror(
+                "Unable to Check for Updates",
+                "Stalk could not connect to GitHub.\n\n"
+                "Check the Internet connection and try again.",
+            )
+        except (json.JSONDecodeError, ValueError, KeyError) as exc:
+            messagebox.showerror(
+                "Invalid Update Information",
+                f"The GitHub update file could not be read.\n\n{exc}",
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "Update Check Error",
+                f"An unexpected error occurred while checking for updates.\n\n{exc}",
+            )
+
     def show_about(self):
         messagebox.showinfo(
-            "About Simple Inventory",
-            "Simple Inventory\n\n"
+            f"About {APP_NAME}",
+            f"{APP_NAME}\nVersion {APP_VERSION}\n\n"
             "Inventory, shipments, invoicing, customer management, transactions, "
-            "statements, and CSV exports.",
+            "refunds, statements, and CSV exports.",
         )
 
     # ---------- Inventory Tab ----------
