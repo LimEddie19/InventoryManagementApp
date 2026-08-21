@@ -1,14 +1,15 @@
 {
-    "version": "1.3.2",
+    "version": "1.1.0",
     "notes": [
-        "Initial public release",
-        "Inventory management",
-        "Shipment management",
-        "Customer accounts",
-        "Refund system",
-        "Transactions",
-        "Monthly & yearly statements",
-        "Chromebook support"
+        "Added built-in update system",
+        "Added Help → Check for Updates",
+        "Added application version tracking",
+        "Added startup background update checks",
+        "Added update notification dialog",
+        "Added 'Skip This Version' support",
+        "Added update preferences",
+        "Improved update reliability and offline handling",
+        "Various bug fixes and performance improvements"
     ],
     "release_url": "https://github.com/LimEddie19/InventoryManagementApp/releases/latest"
 }
