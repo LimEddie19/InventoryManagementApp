@@ -15,7 +15,7 @@ from html import escape
 
 
 APP_NAME = "Stalk"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
 
 # GitHub-hosted release metadata used by Help > Check for Updates.
 UPDATE_INFO_URL = (
