@@ -84,6 +84,29 @@ class InventoryDB:
         """)
 
         self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS shipments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref_number TEXT NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """)
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS shipment_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shipment_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            item_name TEXT NOT NULL,
+            entered_qty INTEGER NOT NULL,
+            received_as TEXT NOT NULL CHECK(received_as IN ('box','unit')),
+            unit_qty INTEGER NOT NULL,
+            units_per_box INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY(shipment_id) REFERENCES shipments(id),
+            FOREIGN KEY(item_id) REFERENCES items(id)
+        );
+        """)
+        self.conn.execute("""
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             customer_id INTEGER,
@@ -128,6 +151,22 @@ class InventoryDB:
         """)
 
         self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS invoice_adjustments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER NOT NULL,
+            source_invoice_id INTEGER,
+            source_invoice_line_id INTEGER,
+            source_ref_number TEXT,
+            item_name TEXT,
+            amount REAL NOT NULL CHECK(amount > 0),
+            reason TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(invoice_id) REFERENCES invoices(id),
+            FOREIGN KEY(source_invoice_id) REFERENCES invoices(id),
+            FOREIGN KEY(source_invoice_line_id) REFERENCES invoice_lines(id)
+        );
+        """)
+        self.conn.execute("""
         CREATE TABLE IF NOT EXISTS customers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             store_name TEXT NOT NULL UNIQUE,
@@ -138,6 +177,7 @@ class InventoryDB:
         );
         """)
         self._ensure_customer_columns()
+        self.ensure_internal_use_customer()
         self._ensure_invoice_line_columns()
 
         self.conn.execute("""
@@ -346,8 +386,9 @@ class InventoryDB:
         params = []
         where = ""
         if search_text.strip():
-            where = "WHERE i.name LIKE ?"
-            params.append(f"%{search_text.strip()}%")
+            where = "WHERE (i.name LIKE ? OR COALESCE(i.sku,'') LIKE ?)"
+            like = f"%{search_text.strip()}%"
+            params.extend((like, like))
         cur.execute(f"""
             SELECT i.id, i.name, COALESCE(i.sku,''), COALESCE(i.price,0),
                    COALESCE(i.unit_price,0), COALESCE(i.units_per_box,1),
@@ -429,6 +470,45 @@ class InventoryDB:
             FROM items WHERE id=?;
         """,(item_id,)); return cur.fetchone()
 
+    def ensure_internal_use_customer(self):
+        name = "INTERNAL USE"
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT id FROM customers WHERE store_name = ? COLLATE NOCASE;",
+            (name,)
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+        cur.execute("""
+            INSERT INTO customers (store_name, address, phone, credit_balance, updated_at)
+            VALUES (?, ?, ?, 0, ?);
+        """, (name, "Warehouse / Company Internal Use", "", now_str()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def is_internal_use_customer(self, customer_id):
+        if customer_id is None:
+            return False
+        cur = self.conn.cursor()
+        cur.execute("SELECT store_name FROM customers WHERE id = ?;", (customer_id,))
+        row = cur.fetchone()
+        return bool(row and str(row[0]).strip().upper() == "INTERNAL USE")
+
+    def mark_invoice_internal_use(self, invoice_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            UPDATE invoices
+            SET status = 'closed',
+                payment_method = 'internal use',
+                paid_at = ?
+            WHERE id = ? AND status = 'open';
+        """, (now_str(), invoice_id))
+        if cur.rowcount != 1:
+            raise ValueError("Internal-use invoice could not be completed.")
+        self.conn.commit()
+
     def list_customers(self, search_text=""):
         cur = self.conn.cursor()
         if search_text.strip():
@@ -509,6 +589,8 @@ class InventoryDB:
         row = cur.fetchone()
         if not row:
             raise ValueError("Customer not found.")
+        if str(row[0]).strip().upper() == "INTERNAL USE":
+            raise ValueError("INTERNAL USE is a built-in warehouse account and cannot be deleted.")
         self.conn.execute("UPDATE invoices SET customer_id = NULL WHERE customer_id = ?;", (customer_id,))
         self.conn.execute("DELETE FROM customers WHERE id = ?;", (customer_id,))
         self.conn.commit()
@@ -675,9 +757,15 @@ class InventoryDB:
         return (float(row[0]), row[1]) if row else (0.0, "")
 
     def get_invoice_price_details(self, customer_id, item_id, sale_type="box"):
-        base_price, pricing_type = self.get_effective_item_price(customer_id, item_id, sale_type)
+        if self.is_internal_use_customer(customer_id):
+            return 0.0, 0.0, 0.0, "Internal Use", ""
+
+        base_price, pricing_type = self.get_effective_item_price(
+            customer_id, item_id, sale_type
+        )
         surcharge, reason = self.get_active_item_surcharge(item_id, sale_type)
         return base_price, surcharge, base_price + surcharge, pricing_type, reason
+
 
     def list_refundable_invoices(self):
         cur = self.conn.cursor()
@@ -790,6 +878,62 @@ class InventoryDB:
              float(base_price),float(surcharge_amount),surcharge_reason.strip(),float(charged_price),float(charged_price)*int(qty)))
         self.conn.commit()
 
+    def list_closed_invoice_lines_for_customer(self, customer_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT inv.id, inv.ref_number, inv.created_at,
+                   il.id, il.item_name, il.qty, il.sale_type,
+                   il.unit_price, il.line_total
+            FROM invoices inv
+            JOIN invoice_lines il ON il.invoice_id = inv.id
+            WHERE inv.customer_id = ?
+              AND inv.status = 'closed'
+              AND LOWER(COALESCE(inv.payment_method,'')) <> 'internal use'
+            ORDER BY inv.id DESC, il.id;
+        """, (customer_id,))
+        return cur.fetchall()
+
+    def save_invoice_adjustment(
+        self, invoice_id, source_invoice_id, source_invoice_line_id,
+        source_ref_number, item_name, amount, reason=""
+    ):
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Additional charge must be greater than zero.")
+        self.conn.execute("""
+            INSERT INTO invoice_adjustments(
+                invoice_id, source_invoice_id, source_invoice_line_id,
+                source_ref_number, item_name, amount, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            invoice_id, source_invoice_id, source_invoice_line_id,
+            str(source_ref_number or "").strip(),
+            str(item_name or "").strip(),
+            amount, str(reason or "").strip(), now_str()
+        ))
+        self.conn.commit()
+
+    def get_invoice_adjustments(self, invoice_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, source_invoice_id, source_invoice_line_id,
+                   COALESCE(source_ref_number,''), COALESCE(item_name,''),
+                   amount, COALESCE(reason,''), created_at
+            FROM invoice_adjustments
+            WHERE invoice_id = ?
+            ORDER BY id;
+        """, (invoice_id,))
+        return cur.fetchall()
+
+    def get_invoice_adjustment_total(self, invoice_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT COALESCE(SUM(amount),0)
+            FROM invoice_adjustments
+            WHERE invoice_id = ?;
+        """, (invoice_id,))
+        return float(cur.fetchone()[0] or 0)
+
     def list_invoices(self):
         cur = self.conn.cursor()
         cur.execute("""
@@ -814,6 +958,217 @@ class InventoryDB:
     def get_invoice_lines(self, invoice_id):
         cur=self.conn.cursor(); cur.execute("""SELECT item_name,qty,sale_type,base_price,surcharge_amount,COALESCE(surcharge_reason,''),unit_price,line_total FROM invoice_lines WHERE invoice_id=? ORDER BY id""",(invoice_id,)); return cur.fetchall()
 
+    def get_invoice_lines_for_edit(self, invoice_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, item_id, item_name, qty, sale_type, unit_qty, units_per_box,
+                   base_price, surcharge_amount, COALESCE(surcharge_reason,''),
+                   unit_price, line_total
+            FROM invoice_lines
+            WHERE invoice_id = ?
+            ORDER BY id;
+        """, (invoice_id,))
+        return cur.fetchall()
+
+    def get_invoice_customer_id(self, invoice_id):
+        cur = self.conn.cursor()
+        cur.execute("SELECT customer_id FROM invoices WHERE id = ?;", (invoice_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def update_open_invoice_lines(self, invoice_id, lines):
+        if not lines:
+            raise ValueError("An invoice must contain at least one item.")
+
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT ref_number, status, discount_percent, credit, customer_id
+            FROM invoices WHERE id = ?;
+        """, (invoice_id,))
+        invoice = cur.fetchone()
+        if not invoice:
+            raise ValueError("Invoice not found.")
+
+        ref_number, status, discount_percent, old_credit, customer_id = invoice
+        if status != "open":
+            raise ValueError("Only open invoices can be edited.")
+
+        cur.execute("SELECT item_id, unit_qty FROM invoice_lines WHERE invoice_id = ?;", (invoice_id,))
+        old_units = {}
+        for item_id, unit_qty in cur.fetchall():
+            old_units[item_id] = old_units.get(item_id, 0) + int(unit_qty)
+
+        new_units = {}
+        subtotal = 0.0
+        validated = []
+
+        for line in lines:
+            item_id, item_name, qty, sale_type, unit_qty, units_per_box, base_price, surcharge_amount, charged_price, pricing_type, surcharge_reason = line
+            qty = int(qty)
+            unit_qty = int(unit_qty)
+            units_per_box = int(units_per_box)
+            if qty <= 0 or unit_qty <= 0:
+                raise ValueError(f"Quantity for {item_name} must be greater than zero.")
+            if sale_type not in {"box", "unit"}:
+                raise ValueError("Sale type must be box or unit.")
+
+            cur.execute("SELECT name, qty FROM items WHERE id = ?;", (item_id,))
+            item = cur.fetchone()
+            if not item:
+                raise ValueError(f"Item not found: {item_name}")
+
+            new_units[item_id] = new_units.get(item_id, 0) + unit_qty
+            line_total = float(charged_price) * qty
+            subtotal += line_total
+            validated.append((
+                int(item_id), str(item_name), qty, sale_type, unit_qty, units_per_box,
+                float(base_price), float(surcharge_amount), str(surcharge_reason or ""),
+                float(charged_price), line_total
+            ))
+
+        all_item_ids = set(old_units) | set(new_units)
+        for item_id in all_item_ids:
+            cur.execute("SELECT name, qty FROM items WHERE id = ?;", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("An item on this invoice no longer exists.")
+            item_name, current_qty = row
+            available = int(current_qty) + old_units.get(item_id, 0)
+            requested = new_units.get(item_id, 0)
+            if requested > available:
+                raise ValueError(
+                    f"Not enough stock for {item_name}. Available for this edited invoice: "
+                    f"{available}; requested: {requested}."
+                )
+
+        subtotal += self.get_invoice_adjustment_total(invoice_id)
+
+        discount_percent = float(discount_percent or 0)
+        discount_amount = subtotal * (discount_percent / 100.0)
+        before_credit = max(0.0, subtotal - discount_amount)
+        old_credit = float(old_credit or 0)
+        new_credit = min(old_credit, before_credit)
+        returned_credit = max(0.0, old_credit - new_credit)
+        total = max(0.0, before_credit - new_credit)
+
+        try:
+            self.conn.execute("BEGIN")
+
+            for item_id in all_item_ids:
+                stock_delta = old_units.get(item_id, 0) - new_units.get(item_id, 0)
+                if stock_delta:
+                    cur.execute(
+                        "UPDATE items SET qty = qty + ?, updated_at = ? WHERE id = ?;",
+                        (stock_delta, now_str(), item_id)
+                    )
+                    cur.execute("""
+                        INSERT INTO txns(type, ref_number, item_id, qty_change, note, created_at)
+                        VALUES ('INVOICE', ?, ?, ?, ?, ?);
+                    """, (
+                        ref_number, item_id, stock_delta,
+                        "Open invoice edit adjustment", now_str()
+                    ))
+
+            cur.execute("DELETE FROM invoice_lines WHERE invoice_id = ?;", (invoice_id,))
+            for item_id, item_name, qty, sale_type, unit_qty, units_per_box, base_price, surcharge_amount, surcharge_reason, charged_price, line_total in validated:
+                cur.execute("""
+                    INSERT INTO invoice_lines(
+                        invoice_id, item_id, item_name, qty, sale_type, unit_qty,
+                        units_per_box, base_price, surcharge_amount, surcharge_reason,
+                        unit_price, line_total
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    invoice_id, item_id, item_name, qty, sale_type, unit_qty,
+                    units_per_box, base_price, surcharge_amount, surcharge_reason,
+                    charged_price, line_total
+                ))
+
+            cur.execute("""
+                UPDATE invoices
+                SET subtotal = ?, discount_amount = ?, credit = ?, total = ?
+                WHERE id = ? AND status = 'open';
+            """, (subtotal, discount_amount, new_credit, total, invoice_id))
+
+            if returned_credit > 0 and customer_id is not None:
+                cur.execute(
+                    "UPDATE customers SET credit_balance = credit_balance + ?, updated_at = ? WHERE id = ?;",
+                    (returned_credit, now_str(), customer_id)
+                )
+                cur.execute("""
+                    INSERT INTO customer_credit_history
+                        (customer_id, amount, entry_type, reference, note, created_at)
+                    VALUES (?, ?, 'ADJUSTMENT', ?, ?, ?);
+                """, (
+                    customer_id, returned_credit, f"Invoice {ref_number}",
+                    "Credit returned after open invoice edit", now_str()
+                ))
+
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        return subtotal, discount_amount, new_credit, total
+
+    def list_open_invoices_for_customer(self, customer_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, ref_number, created_at, COALESCE(total,0),
+                   COALESCE(store_name,'')
+            FROM invoices
+            WHERE customer_id = ?
+              AND status = 'open'
+            ORDER BY created_at, id;
+        """, (customer_id,))
+        return cur.fetchall()
+
+    def close_multiple_invoices(self, invoice_ids, payment_method):
+        invoice_ids = [int(x) for x in invoice_ids]
+        if not invoice_ids:
+            raise ValueError("Select at least one open invoice.")
+
+        placeholders = ",".join("?" for _ in invoice_ids)
+        cur = self.conn.cursor()
+        cur.execute(f"""
+            SELECT id, ref_number, status, COALESCE(total,0), customer_id
+            FROM invoices
+            WHERE id IN ({placeholders});
+        """, invoice_ids)
+        rows = cur.fetchall()
+
+        if len(rows) != len(invoice_ids):
+            raise ValueError("One or more selected invoices could not be found.")
+
+        customer_ids = {row[4] for row in rows}
+        if len(customer_ids) != 1:
+            raise ValueError("Combined payment can only include one customer.")
+
+        for invoice_id, ref, status, total, customer_id in rows:
+            if status != "open":
+                raise ValueError(f"Invoice {ref} is no longer open.")
+
+        paid_at = now_str()
+        try:
+            self.conn.execute("BEGIN")
+            for invoice_id in invoice_ids:
+                cur.execute("""
+                    UPDATE invoices
+                    SET status='closed', payment_method=?, paid_at=?
+                    WHERE id=? AND status='open';
+                """, (payment_method, paid_at, invoice_id))
+                if cur.rowcount != 1:
+                    raise ValueError("An invoice changed status before payment completed.")
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        return {
+            "invoice_count": len(rows),
+            "total": sum(float(row[3] or 0) for row in rows),
+            "refs": [str(row[1]) for row in rows],
+        }
+
     def close_invoice(self, invoice_id, payment_method):
         payment_method = payment_method.strip()
         allowed = {"cash", "check", "Zelle", "credit", "other"}
@@ -827,12 +1182,123 @@ class InventoryDB:
         self.conn.commit()
 
     def void_invoice(self, invoice_id):
-        self.conn.execute("""
-            UPDATE invoices
-            SET status = 'void'
-            WHERE id = ? AND status != 'closed';
+        cur = self.conn.cursor()
+
+        cur.execute("""
+            SELECT ref_number, status, customer_id, COALESCE(credit, 0)
+            FROM invoices
+            WHERE id = ?;
         """, (invoice_id,))
-        self.conn.commit()
+        invoice = cur.fetchone()
+
+        if not invoice:
+            raise ValueError("Invoice not found.")
+
+        ref_number, status, customer_id, applied_credit = invoice
+
+        if status == "closed":
+            raise ValueError("Closed invoices cannot be voided.")
+        if status == "void":
+            raise ValueError("This invoice has already been voided.")
+        if status != "open":
+            raise ValueError("Only open invoices can be voided.")
+
+        cur.execute("""
+            SELECT item_id, COALESCE(unit_qty, 0)
+            FROM invoice_lines
+            WHERE invoice_id = ?;
+        """, (invoice_id,))
+        lines = cur.fetchall()
+
+        try:
+            self.conn.execute("BEGIN")
+
+            for item_id, unit_qty in lines:
+                unit_qty = int(unit_qty or 0)
+                if unit_qty <= 0:
+                    continue
+
+                cur.execute("""
+                    UPDATE items
+                    SET qty = qty + ?, updated_at = ?
+                    WHERE id = ?;
+                """, (unit_qty, now_str(), item_id))
+
+                if cur.rowcount != 1:
+                    raise ValueError(
+                        "An item on this invoice no longer exists. "
+                        "The invoice was not voided."
+                    )
+
+                cur.execute("""
+                    INSERT INTO txns
+                        (type, ref_number, item_id, qty_change, note, created_at)
+                    VALUES ('INVOICE', ?, ?, ?, ?, ?);
+                """, (
+                    ref_number,
+                    item_id,
+                    unit_qty,
+                    "Stock restored from voided open invoice",
+                    now_str(),
+                ))
+
+            applied_credit = float(applied_credit or 0)
+            if applied_credit > 0:
+                if customer_id is None:
+                    raise ValueError(
+                        "This invoice has applied customer credit but is not linked "
+                        "to a customer. The invoice was not voided."
+                    )
+
+                cur.execute("""
+                    UPDATE customers
+                    SET credit_balance = credit_balance + ?, updated_at = ?
+                    WHERE id = ?;
+                """, (applied_credit, now_str(), customer_id))
+
+                if cur.rowcount != 1:
+                    raise ValueError(
+                        "The customer linked to this invoice no longer exists. "
+                        "The invoice was not voided."
+                    )
+
+                cur.execute("""
+                    INSERT INTO customer_credit_history
+                        (customer_id, amount, entry_type, reference, note, created_at)
+                    VALUES (?, ?, 'ADJUSTMENT', ?, ?, ?);
+                """, (
+                    customer_id,
+                    applied_credit,
+                    f"Invoice {ref_number}",
+                    "Account credit restored because open invoice was voided",
+                    now_str(),
+                ))
+
+            cur.execute("""
+                UPDATE invoices
+                SET status = 'void',
+                    payment_method = NULL,
+                    paid_at = NULL
+                WHERE id = ? AND status = 'open';
+            """, (invoice_id,))
+
+            if cur.rowcount != 1:
+                raise ValueError(
+                    "Invoice status changed before the void could be completed."
+                )
+
+            self.conn.commit()
+
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        return {
+            "ref_number": ref_number,
+            "restored_units": sum(int(row[1] or 0) for row in lines),
+            "restored_credit": applied_credit,
+        }
+
 
     def _month_bounds(self, year, month):
         start = f"{int(year):04d}-{int(month):02d}-01 00:00"
@@ -1010,6 +1476,295 @@ class InventoryDB:
         """, (int(year),))
         return cur.fetchall()
 
+    def record_full_shipment(self, ref_number, lines, note=""):
+        ref_number = ref_number.strip()
+        if not ref_number:
+            raise ValueError("Shipment number is required.")
+        if not lines:
+            raise ValueError("Add at least one item to the shipment list.")
+
+        cur = self.conn.cursor()
+        created = now_str()
+
+        try:
+            self.conn.execute("BEGIN")
+            cur.execute("""
+                INSERT INTO shipments(ref_number, note, created_at, updated_at)
+                VALUES (?, ?, ?, ?);
+            """, (ref_number, note.strip(), created, created))
+            shipment_id = cur.lastrowid
+
+            for item_id, item_name, qty, received_as, unit_qty in lines:
+                qty = int(qty)
+                unit_qty = int(unit_qty)
+                if qty <= 0 or unit_qty <= 0:
+                    raise ValueError(f"Quantity for {item_name} must be greater than zero.")
+                if received_as not in {"box", "unit"}:
+                    raise ValueError("Received as must be box or unit.")
+
+                cur.execute(
+                    "SELECT qty, units_per_box FROM items WHERE id = ?;",
+                    (item_id,)
+                )
+                item = cur.fetchone()
+                if not item:
+                    raise ValueError(f"Item not found: {item_name}")
+
+                current_qty, units_per_box = item
+                expected_units = qty * (
+                    int(units_per_box) if received_as == "box" else 1
+                )
+                if expected_units != unit_qty:
+                    unit_qty = expected_units
+
+                new_qty = int(current_qty) + unit_qty
+                cur.execute("""
+                    UPDATE items
+                    SET qty = ?, restock_total = ?, updated_at = ?
+                    WHERE id = ?;
+                """, (new_qty, new_qty, created, item_id))
+
+                cur.execute("""
+                    INSERT INTO shipment_lines(
+                        shipment_id, item_id, item_name, entered_qty,
+                        received_as, unit_qty, units_per_box
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    shipment_id, item_id, item_name, qty,
+                    received_as, unit_qty, int(units_per_box)
+                ))
+
+                cur.execute("""
+                    INSERT INTO txns(
+                        type, ref_number, item_id, qty_change, note, created_at
+                    ) VALUES ('SHIPMENT', ?, ?, ?, ?, ?);
+                """, (
+                    ref_number,
+                    item_id,
+                    unit_qty,
+                    f"{qty} {received_as}(s). {note.strip()}",
+                    created,
+                ))
+
+            self.conn.commit()
+            return shipment_id
+
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_shipment_by_ref(self, ref_number):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, ref_number, COALESCE(note,''), created_at, updated_at
+            FROM shipments
+            WHERE ref_number = ?
+            ORDER BY id DESC
+            LIMIT 1;
+        """, (ref_number,))
+        return cur.fetchone()
+
+    def get_shipment_lines(self, shipment_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, item_id, item_name, entered_qty, received_as,
+                   unit_qty, units_per_box
+            FROM shipment_lines
+            WHERE shipment_id = ?
+            ORDER BY id;
+        """, (shipment_id,))
+        return cur.fetchall()
+
+    def get_legacy_shipment_lines(self, ref_number):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT t.item_id, i.name, SUM(t.qty_change) AS units,
+                   GROUP_CONCAT(COALESCE(t.note,''), ' | ')
+            FROM txns t
+            JOIN items i ON i.id = t.item_id
+            WHERE t.type = 'SHIPMENT' AND t.ref_number = ?
+            GROUP BY t.item_id, i.name
+            HAVING SUM(t.qty_change) <> 0
+            ORDER BY i.name COLLATE NOCASE;
+        """, (ref_number,))
+        return cur.fetchall()
+
+    def update_shipment(self, shipment_id, lines, note=""):
+        if not lines:
+            raise ValueError("A shipment must contain at least one item.")
+
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT ref_number
+            FROM shipments
+            WHERE id = ?;
+        """, (shipment_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError("Shipment not found.")
+        ref_number = row[0]
+
+        cur.execute("""
+            SELECT item_id, unit_qty
+            FROM shipment_lines
+            WHERE shipment_id = ?;
+        """, (shipment_id,))
+        old_units = {}
+        for item_id, unit_qty in cur.fetchall():
+            old_units[item_id] = old_units.get(item_id, 0) + int(unit_qty)
+
+        validated = []
+        new_units = {}
+
+        for item_id, item_name, qty, received_as, unit_qty in lines:
+            qty = int(qty)
+            if qty <= 0:
+                raise ValueError(f"Quantity for {item_name} must be greater than zero.")
+            if received_as not in {"box", "unit"}:
+                raise ValueError("Received as must be box or unit.")
+
+            cur.execute(
+                "SELECT qty, units_per_box, restock_total FROM items WHERE id = ?;",
+                (item_id,)
+            )
+            item = cur.fetchone()
+            if not item:
+                raise ValueError(f"Item not found: {item_name}")
+
+            current_qty, units_per_box, restock_total = item
+            calculated_units = qty * (
+                int(units_per_box) if received_as == "box" else 1
+            )
+            new_units[item_id] = new_units.get(item_id, 0) + calculated_units
+            validated.append((
+                item_id, item_name, qty, received_as,
+                calculated_units, int(units_per_box)
+            ))
+
+        # Reducing a historical shipment removes stock that had previously
+        # been added. Do not allow the correction to make current stock negative.
+        all_ids = set(old_units) | set(new_units)
+        for item_id in all_ids:
+            cur.execute("SELECT name, qty FROM items WHERE id = ?;", (item_id,))
+            item_name, current_qty = cur.fetchone()
+            delta = new_units.get(item_id, 0) - old_units.get(item_id, 0)
+            if int(current_qty) + delta < 0:
+                raise ValueError(
+                    f"Cannot reduce shipment enough for {item_name}. "
+                    f"Current stock is {current_qty}; correction would remove {-delta} unit(s)."
+                )
+
+        updated = now_str()
+        try:
+            self.conn.execute("BEGIN")
+
+            for item_id in all_ids:
+                delta = new_units.get(item_id, 0) - old_units.get(item_id, 0)
+                if not delta:
+                    continue
+
+                cur.execute("""
+                    UPDATE items
+                    SET qty = qty + ?,
+                        restock_total = MAX(0, restock_total + ?),
+                        updated_at = ?
+                    WHERE id = ?;
+                """, (delta, delta, updated, item_id))
+
+                cur.execute("""
+                    INSERT INTO txns(
+                        type, ref_number, item_id, qty_change, note, created_at
+                    ) VALUES ('SHIPMENT', ?, ?, ?, ?, ?);
+                """, (
+                    ref_number,
+                    item_id,
+                    delta,
+                    "Shipment correction adjustment",
+                    updated,
+                ))
+
+            cur.execute(
+                "DELETE FROM shipment_lines WHERE shipment_id = ?;",
+                (shipment_id,)
+            )
+            for item_id, item_name, qty, received_as, unit_qty, units_per_box in validated:
+                cur.execute("""
+                    INSERT INTO shipment_lines(
+                        shipment_id, item_id, item_name, entered_qty,
+                        received_as, unit_qty, units_per_box
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    shipment_id, item_id, item_name, qty,
+                    received_as, unit_qty, units_per_box
+                ))
+
+            cur.execute("""
+                UPDATE shipments
+                SET note = ?, updated_at = ?
+                WHERE id = ?;
+            """, (note.strip(), updated, shipment_id))
+
+            self.conn.commit()
+
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def correct_legacy_shipment_units(self, ref_number, lines):
+        cur = self.conn.cursor()
+
+        old_rows = self.get_legacy_shipment_lines(ref_number)
+        old_units = {int(row[0]): int(row[2]) for row in old_rows}
+        new_units = {}
+        for item_id, item_name, units in lines:
+            units = int(units)
+            if units < 0:
+                raise ValueError("Shipment units cannot be negative.")
+            if units:
+                new_units[int(item_id)] = new_units.get(int(item_id), 0) + units
+
+        all_ids = set(old_units) | set(new_units)
+        for item_id in all_ids:
+            cur.execute("SELECT name, qty FROM items WHERE id = ?;", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("An item from this legacy shipment no longer exists.")
+            item_name, current_qty = row
+            delta = new_units.get(item_id, 0) - old_units.get(item_id, 0)
+            if int(current_qty) + delta < 0:
+                raise ValueError(
+                    f"Cannot apply this correction for {item_name}; "
+                    "current inventory would become negative."
+                )
+
+        corrected = now_str()
+        try:
+            self.conn.execute("BEGIN")
+            for item_id in all_ids:
+                delta = new_units.get(item_id, 0) - old_units.get(item_id, 0)
+                if not delta:
+                    continue
+                cur.execute("""
+                    UPDATE items
+                    SET qty = qty + ?,
+                        restock_total = MAX(0, restock_total + ?),
+                        updated_at = ?
+                    WHERE id = ?;
+                """, (delta, delta, corrected, item_id))
+                cur.execute("""
+                    INSERT INTO txns(
+                        type, ref_number, item_id, qty_change, note, created_at
+                    ) VALUES ('SHIPMENT', ?, ?, ?, ?, ?);
+                """, (
+                    ref_number, item_id, delta,
+                    "Legacy shipment correction adjustment",
+                    corrected
+                ))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def record_shipment(self, ref_number, item_id, quantity, received_as="box", note=""):
         if quantity <= 0: raise ValueError("Quantity must be > 0.")
         if received_as not in {"box","unit"}: raise ValueError("Received as must be box or unit.")
@@ -1033,6 +1788,163 @@ class InventoryDB:
         self.conn.execute("UPDATE items SET qty=?,updated_at=? WHERE id=?",(row[0]-unit_qty,now_str(),item_id))
         self.conn.execute("INSERT INTO txns(type,ref_number,item_id,qty_change,note,created_at) VALUES('INVOICE',?,?,?,?,?)",(ref_number,item_id,-unit_qty,note.strip(),now_str()))
         self.conn.commit()
+
+    def list_document_history(self, limit=500):
+        cur = self.conn.cursor()
+        rows = []
+
+        # One row per invoice/order.
+        cur.execute("""
+            SELECT inv.id, inv.created_at, inv.ref_number,
+                   COALESCE(inv.store_name,''),
+                   COALESCE(inv.total,0),
+                   COALESCE(inv.status,'open'),
+                   COALESCE(inv.payment_method,''),
+                   COUNT(il.id),
+                   COALESCE(SUM(il.unit_qty),0)
+            FROM invoices inv
+            LEFT JOIN invoice_lines il ON il.invoice_id = inv.id
+            GROUP BY inv.id
+            ORDER BY inv.id DESC;
+        """)
+        for invoice_id, created_at, ref, store, total, status, payment, line_count, units in cur.fetchall():
+            is_internal = str(payment or "").strip().lower() == "internal use"
+            typ = "Internal Use" if is_internal else "Invoice"
+            display_status = "Completed" if is_internal else str(status or "open").title()
+            summary = (
+                f"{int(line_count or 0)} item(s) / {int(units or 0)} unit(s)"
+                + ("" if is_internal else f" / {money(total)}")
+            )
+            rows.append((
+                f"invoice:{invoice_id}",
+                created_at,
+                typ,
+                ref,
+                store or "—",
+                summary,
+                display_status,
+            ))
+
+        # New-format shipments created after detailed shipment storage was added.
+        cur.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='shipments';
+        """)
+        has_shipments = cur.fetchone() is not None
+
+        if has_shipments:
+            cur.execute("""
+                SELECT s.id, s.created_at, s.ref_number, COALESCE(s.note,''),
+                       COUNT(sl.id), COALESCE(SUM(sl.unit_qty),0),
+                       CASE WHEN EXISTS(
+                           SELECT 1 FROM txns t
+                           WHERE t.type='SHIPMENT'
+                             AND t.ref_number=s.ref_number
+                             AND LOWER(COALESCE(t.note,'')) LIKE '%correction%'
+                       ) THEN 1 ELSE 0 END
+                FROM shipments s
+                LEFT JOIN shipment_lines sl ON sl.shipment_id=s.id
+                GROUP BY s.id
+                ORDER BY s.id DESC;
+            """)
+            for shipment_id, created_at, ref, note, line_count, units, corrected in cur.fetchall():
+                rows.append((
+                    f"shipment:{ref}",
+                    created_at,
+                    "Shipment",
+                    ref,
+                    note.strip() or "Warehouse Receipt",
+                    f"{int(line_count or 0)} item(s) / +{int(units or 0)} unit(s)",
+                    "Corrected" if corrected else "Completed",
+                ))
+
+        # Legacy shipments were recorded only in txns. Group the entire shipment
+        # reference into one logical row instead of exposing every item movement.
+        if has_shipments:
+            legacy_sql = """
+                SELECT MIN(t.created_at), t.ref_number,
+                       COUNT(DISTINCT t.item_id),
+                       COALESCE(SUM(t.qty_change),0),
+                       MAX(CASE WHEN LOWER(COALESCE(t.note,'')) LIKE '%correction%'
+                                THEN 1 ELSE 0 END)
+                FROM txns t
+                WHERE t.type='SHIPMENT'
+                  AND NOT EXISTS(
+                      SELECT 1 FROM shipments s WHERE s.ref_number=t.ref_number
+                  )
+                GROUP BY t.ref_number;
+            """
+        else:
+            legacy_sql = """
+                SELECT MIN(t.created_at), t.ref_number,
+                       COUNT(DISTINCT t.item_id),
+                       COALESCE(SUM(t.qty_change),0),
+                       MAX(CASE WHEN LOWER(COALESCE(t.note,'')) LIKE '%correction%'
+                                THEN 1 ELSE 0 END)
+                FROM txns t
+                WHERE t.type='SHIPMENT'
+                GROUP BY t.ref_number;
+            """
+
+        cur.execute(legacy_sql)
+        for created_at, ref, item_count, units, corrected in cur.fetchall():
+            rows.append((
+                f"shipment:{ref}",
+                created_at,
+                "Shipment",
+                ref,
+                "Legacy Shipment",
+                f"{int(item_count or 0)} item(s) / +{int(units or 0)} unit(s)",
+                "Corrected" if corrected else "Completed",
+            ))
+
+        # Refunds get one row per refund rather than one row per returned item.
+        cur.execute("""
+            SELECT r.id, r.created_at, COALESCE(inv.ref_number,''),
+                   COALESCE(inv.store_name,''), COALESCE(r.total,0),
+                   COUNT(rl.id), COALESCE(SUM(rl.qty),0),
+                   COALESCE(r.refund_method,'')
+            FROM refunds r
+            LEFT JOIN invoices inv ON inv.id=r.invoice_id
+            LEFT JOIN refund_lines rl ON rl.refund_id=r.id
+            GROUP BY r.id
+            ORDER BY r.id DESC;
+        """)
+        for refund_id, created_at, invoice_ref, store, total, line_count, qty, method in cur.fetchall():
+            rows.append((
+                f"refund:{refund_id}",
+                created_at,
+                "Refund",
+                f"Refund #{refund_id}",
+                store or (f"Invoice {invoice_ref}" if invoice_ref else "—"),
+                f"{int(line_count or 0)} item(s) / {money(total)} / {method}",
+                "Completed",
+            ))
+
+        rows.sort(key=lambda row: str(row[1] or ""), reverse=True)
+        return rows[:int(limit)]
+
+    def get_refund_history_detail(self, refund_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT r.id, r.created_at, COALESCE(r.refund_method,''),
+                   COALESCE(r.total,0), COALESCE(r.note,''),
+                   r.invoice_id, COALESCE(inv.ref_number,''),
+                   COALESCE(inv.store_name,'')
+            FROM refunds r
+            LEFT JOIN invoices inv ON inv.id=r.invoice_id
+            WHERE r.id=?;
+        """, (refund_id,))
+        header = cur.fetchone()
+        if not header:
+            return None, []
+        cur.execute("""
+            SELECT item_name, qty, unit_price, line_total
+            FROM refund_lines
+            WHERE refund_id=?
+            ORDER BY id;
+        """, (refund_id,))
+        return header, cur.fetchall()
 
     def list_history(self, limit=200):
         cur = self.conn.cursor()
@@ -1093,6 +2005,7 @@ class App(tk.Tk):
 
         self.shipment_lines = []
         self.invoice_lines = []
+        self.invoice_adjustments = []
         self.update_settings = self._load_update_settings()
         self._update_check_running = False
 
@@ -1105,6 +2018,36 @@ class App(tk.Tk):
         if self.update_settings.get("check_updates_on_startup", True):
             self.after(1500, self.check_for_updates_in_background)
 
+    def _create_scrollable_area(self, parent, padding=12):
+        outer = ttk.Frame(parent)
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        content = ttk.Frame(canvas, padding=padding)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def update_region(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        content.bind("<Configure>", update_region)
+        canvas.bind("<Configure>", fit_width)
+
+        outer._scroll_canvas = canvas
+        outer._scroll_content = content
+        return outer, content
+
+    def _make_scrollable_popup_content(self, window, padding=12):
+        outer, content = self._create_scrollable_area(window, padding=padding)
+        outer.pack(fill="both", expand=True)
+        return content
+
     def _build_ui(self):
         header = ttk.Frame(self, padding=12)
         header.pack(fill="x")
@@ -1114,23 +2057,31 @@ class App(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=12, pady=12)
 
-        self.tab_inventory = ttk.Frame(self.notebook, padding=12)
-        self.tab_shipment = ttk.Frame(self.notebook, padding=12)
-        self.tab_invoice = ttk.Frame(self.notebook, padding=12)
-        self.tab_customers = ttk.Frame(self.notebook, padding=12)
-        self.tab_refunds = ttk.Frame(self.notebook, padding=12)
-        self.tab_transactions = ttk.Frame(self.notebook, padding=12)
-        self.tab_statements = ttk.Frame(self.notebook, padding=12)
-        self.tab_history = ttk.Frame(self.notebook, padding=12)
+        self.tab_inventory_page, self.tab_inventory = self._create_scrollable_area(self.notebook)
+        self.tab_shipment_page, self.tab_shipment = self._create_scrollable_area(self.notebook)
+        self.tab_invoice_page, self.tab_invoice = self._create_scrollable_area(self.notebook)
+        self.tab_customers_page, self.tab_customers = self._create_scrollable_area(self.notebook)
+        self.tab_refunds_page, self.tab_refunds = self._create_scrollable_area(self.notebook)
+        self.tab_transactions_page, self.tab_transactions = self._create_scrollable_area(self.notebook)
+        self.tab_statements_page, self.tab_statements = self._create_scrollable_area(self.notebook)
+        self.tab_history_page, self.tab_history = self._create_scrollable_area(self.notebook)
 
-        self.notebook.add(self.tab_inventory, text="Inventory")
-        self.notebook.add(self.tab_shipment, text="Add Shipment")
-        self.notebook.add(self.tab_invoice, text="Record Invoice")
-        self.notebook.add(self.tab_customers, text="Customer Management")
-        self.notebook.add(self.tab_refunds, text="Refunds / Accounts")
-        self.notebook.add(self.tab_transactions, text="Transactions")
-        self.notebook.add(self.tab_statements, text="Statements")
-        self.notebook.add(self.tab_history, text="History")
+        self.notebook.add(self.tab_inventory_page, text="Inventory")
+        self.notebook.add(self.tab_shipment_page, text="Add Shipment")
+        self.notebook.add(self.tab_invoice_page, text="Record Invoice")
+        self.notebook.add(self.tab_customers_page, text="Customer Management")
+        self.notebook.add(self.tab_refunds_page, text="Refunds / Accounts")
+        self.notebook.add(self.tab_transactions_page, text="Transactions")
+        self.notebook.add(self.tab_statements_page, text="Statements")
+        self.notebook.add(self.tab_history_page, text="History")
+        self.tab_inventory._notebook_page = self.tab_inventory_page
+        self.tab_shipment._notebook_page = self.tab_shipment_page
+        self.tab_invoice._notebook_page = self.tab_invoice_page
+        self.tab_customers._notebook_page = self.tab_customers_page
+        self.tab_refunds._notebook_page = self.tab_refunds_page
+        self.tab_transactions._notebook_page = self.tab_transactions_page
+        self.tab_statements._notebook_page = self.tab_statements_page
+        self.tab_history._notebook_page = self.tab_history_page
 
         self._build_inventory_tab()
         self._build_shipment_tab()
@@ -1186,7 +2137,8 @@ class App(tk.Tk):
         menu_bar.add_cascade(label="Help", menu=help_menu)
 
     def _select_tab(self, tab):
-        self.notebook.select(tab)
+        page = getattr(tab, "_notebook_page", None)
+        self.notebook.select(page if page is not None else tab)
 
     def _go_to_monthly_statement(self):
         self._select_tab(self.tab_statements)
@@ -1523,11 +2475,21 @@ class App(tk.Tk):
 
         ttk.Label(top, text="Search Item:").pack(side="left")
         self.search_var = tk.StringVar()
-        search_entry = ttk.Entry(top, textvariable=self.search_var, width=30)
-        search_entry.pack(side="left", padx=8)
+        self.search_combo = ttk.Combobox(
+            top,
+            textvariable=self.search_var,
+            values=[row[1] for row in self.db.list_items("")],
+            width=36,
+        )
+        self.search_combo.pack(side="left", padx=8)
+        self._configure_item_autocomplete(
+            self.search_combo, self.search_var, filter_inventory=True
+        )
+        self.search_combo.bind(
+            "<<ComboboxSelected>>", self.on_inventory_search_selected, add="+"
+        )
         ttk.Button(top, text="Search", style="Big.TButton", command=self.refresh_inventory).pack(side="left")
         ttk.Button(top, text="Clear", style="Big.TButton", command=self._clear_search).pack(side="left", padx=(8, 0))
-
         add_box = ttk.LabelFrame(self.tab_inventory, text="Add New Item", padding=12)
         add_box.pack(fill="x", pady=(0, 10))
 
@@ -1631,6 +2593,24 @@ class App(tk.Tk):
         self.search_var.set("")
         self.refresh_inventory()
 
+    def on_inventory_search_typed(self, event=None):
+        return self._autocomplete_keyrelease(
+            self.search_combo, self.search_var, event
+        )
+
+    def on_inventory_search_selected(self, event=None):
+        # Highlight the exact row chosen from the autocomplete suggestions.
+        selected_name = self.search_var.get().strip()
+        self.refresh_inventory()
+
+        for item_id in self.tree.get_children():
+            values = self.tree.item(item_id, "values")
+            if values and str(values[0]).casefold() == selected_name.casefold():
+                self.tree.selection_set(item_id)
+                self.tree.focus(item_id)
+                self.tree.see(item_id)
+                break
+
     def on_add_item(self):
         try:
             self.db.add_item(
@@ -1662,7 +2642,7 @@ class App(tk.Tk):
         _id,name,box_price,unit_price,upb,weight,qty=d
         sku=self.db.conn.execute("SELECT COALESCE(sku,'') FROM items WHERE id=?",(item_id,)).fetchone()[0]
         dialog=tk.Toplevel(self); dialog.title("Edit Item"); dialog.transient(self); dialog.grab_set()
-        frame=ttk.Frame(dialog,padding=16); frame.pack(fill="both",expand=True)
+        frame=self._make_scrollable_popup_content(dialog,padding=16)
         vars_=[tk.StringVar(value=v) for v in (name,sku,f"{box_price:.2f}",f"{unit_price:.2f}",str(upb),weight)]
         labels=("Item Name:","SKU:","Box Price:","Unit Price:","Units Per Box:","Weight:")
         for r,(label,var) in enumerate(zip(labels,vars_)):
@@ -1692,8 +2672,9 @@ class App(tk.Tk):
         win.transient(self)
         win.geometry("900x620")
         win.minsize(780, 520)
+        surcharge_content = self._make_scrollable_popup_content(win, padding=0)
 
-        form = ttk.LabelFrame(win, text="Add Temporary Product Surcharge", padding=12)
+        form = ttk.LabelFrame(surcharge_content, text="Add Temporary Product Surcharge", padding=12)
         form.pack(fill="x", padx=12, pady=12)
         reason_var = tk.StringVar(value="Tariff")
         box_var = tk.StringVar(value="0.00")
@@ -1715,7 +2696,7 @@ class App(tk.Tk):
         ttk.Entry(form,textvariable=note_var).grid(row=2,column=1,columnspan=5,sticky="ew",padx=8,pady=5)
         form.columnconfigure(5,weight=1)
 
-        table_box = ttk.LabelFrame(win, text="Surcharge History", padding=10)
+        table_box = ttk.LabelFrame(surcharge_content, text="Surcharge History", padding=10)
         table_box.pack(fill="both", expand=True, padx=12, pady=(0,12))
         cols=("reason","box","unit","start","end","status","note","updated")
         tree=ttk.Treeview(table_box,columns=cols,show="headings")
@@ -1743,7 +2724,7 @@ class App(tk.Tk):
                 messagebox.showerror("Error","Select a surcharge first.",parent=win); return
             self.db.set_item_surcharge_active(int(selected_row[0]),active); refresh_rows()
 
-        buttons=ttk.Frame(win,padding=(12,0,12,12)); buttons.pack(fill="x")
+        buttons=ttk.Frame(surcharge_content,padding=(12,0,12,12)); buttons.pack(fill="x")
         ttk.Button(buttons,text="Save Surcharge",style="Big.TButton",command=save_surcharge).pack(side="left")
         ttk.Button(buttons,text="Activate Selected",command=lambda:set_active(True)).pack(side="left",padx=8)
         ttk.Button(buttons,text="Deactivate Selected",command=lambda:set_active(False)).pack(side="left")
@@ -1807,8 +2788,11 @@ class App(tk.Tk):
 
         r2 = ttk.Frame(box); r2.pack(fill="x", pady=6)
         ttk.Label(r2, text="Item:", width=18).pack(side="left")
-        self.ship_item_cb = ttk.Combobox(r2, textvariable=self.ship_item, state="readonly", width=40)
+        self.ship_item_cb = ttk.Combobox(
+            r2, textvariable=self.ship_item, width=40
+        )
         self.ship_item_cb.pack(side="left", padx=8)
+        self._configure_item_autocomplete(self.ship_item_cb, self.ship_item)
         ttk.Label(r2, text="Qty:").pack(side="left", padx=(12, 0))
         ttk.Entry(r2, textvariable=self.ship_qty, width=10).pack(side="left", padx=8)
         ttk.Combobox(r2,textvariable=self.ship_type,state="readonly",values=("box","unit"),width=8).pack(side="left",padx=4)
@@ -1857,15 +2841,16 @@ class App(tk.Tk):
     def on_save_shipment(self):
         try:
             ref = self.ship_ref.get().strip()
-
             if not ref:
                 raise ValueError("Shipment number is required.")
-
             if not self.shipment_lines:
                 raise ValueError("Add at least one item to the shipment list.")
 
-            for item_id, item_name, qty, typ, units in self.shipment_lines:
-                self.db.record_shipment(ref, item_id, qty, typ, self.ship_note.get())
+            self.db.record_full_shipment(
+                ref,
+                list(self.shipment_lines),
+                self.ship_note.get(),
+            )
 
             self.shipment_lines.clear()
             self.ship_ref.set("")
@@ -1873,11 +2858,15 @@ class App(tk.Tk):
             self.ship_note.set("")
             self.refresh_shipment_lines()
 
-            messagebox.showinfo("Saved", "Shipment list recorded and stock increased.")
+            messagebox.showinfo(
+                "Saved",
+                "Shipment recorded with full line details and stock increased."
+            )
             self.refresh_all()
 
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
 
     def on_remove_shipment_line(self):
         selected = self.ship_lines_tree.selection()
@@ -1970,8 +2959,11 @@ class App(tk.Tk):
         add_line.columnconfigure(1, weight=1)
 
         ttk.Label(add_line, text="Item:").grid(row=0, column=0, sticky="w")
-        self.inv_item_cb = ttk.Combobox(add_line, textvariable=self.inv_item, state="readonly")
+        self.inv_item_cb = ttk.Combobox(
+            add_line, textvariable=self.inv_item
+        )
         self.inv_item_cb.grid(row=0, column=1, sticky="ew", padx=8)
+        self._configure_item_autocomplete(self.inv_item_cb, self.inv_item)
         ttk.Label(add_line, text="Qty:").grid(row=0, column=2, sticky="w", padx=(8, 0))
         qty_entry = ttk.Entry(add_line, textvariable=self.inv_qty, width=9)
         qty_entry.grid(row=0, column=3, padx=8)
@@ -2014,6 +3006,39 @@ class App(tk.Tk):
         line_buttons.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(line_buttons, text="Remove Selected Line", command=self.on_remove_invoice_line).pack(side="left")
         ttk.Button(line_buttons, text="Clear Lines", command=self.on_clear_invoice_lines).pack(side="left", padx=8)
+        ttk.Button(
+            line_buttons,
+            text="Add Prior Invoice Charge",
+            command=self.on_add_prior_invoice_charge
+        ).pack(side="left", padx=8)
+
+        adjustment_box = ttk.LabelFrame(
+            right, text="Prior Invoice Charges", padding=8
+        )
+        adjustment_box.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        adjustment_box.columnconfigure(0, weight=1)
+
+        self.inv_adjustments_tree = ttk.Treeview(
+            adjustment_box,
+            columns=("invoice", "item", "reason", "amount"),
+            show="headings",
+            height=4,
+        )
+        for col, title, width, anchor in [
+            ("invoice", "Original Invoice", 120, "w"),
+            ("item", "Item", 230, "w"),
+            ("reason", "Reason", 260, "w"),
+            ("amount", "Additional Charge", 130, "e"),
+        ]:
+            self.inv_adjustments_tree.heading(col, text=title)
+            self.inv_adjustments_tree.column(col, width=width, anchor=anchor)
+        self.inv_adjustments_tree.grid(row=0, column=0, sticky="ew")
+
+        ttk.Button(
+            adjustment_box,
+            text="Remove Selected Charge",
+            command=self.on_remove_prior_invoice_charge,
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
         # ----- Fixed footer: totals and save action -----
         footer = ttk.Frame(self.tab_invoice, padding=(0, 10, 0, 0))
@@ -2039,6 +3064,19 @@ class App(tk.Tk):
 
         self.inv_discount.trace_add("write", lambda *_: self._refresh_invoice_total_labels())
         self.inv_credit.trace_add("write", lambda *_: self._refresh_invoice_total_labels())
+
+        combined_payment_row = ttk.Frame(right)
+        combined_payment_row.grid(
+            row=99, column=0, sticky="ew", pady=(10, 0)
+        )
+        ttk.Button(
+            combined_payment_row,
+            text="Combined Payment",
+            style="Big.TButton",
+            command=self.on_combined_invoice_payment,
+        ).pack(side="left")
+
+
     def refresh_customer_dropdowns(self, search_text=""):
         customers = self.db.list_customers(search_text)
         self.customer_lookup = {store: (address, phone, credit) for store, address, phone, credit in customers}
@@ -2075,6 +3113,155 @@ class App(tk.Tk):
         customer = self.db.get_customer_by_store_name(self.inv_store_name.get())
         return customer[0] if customer else None
 
+    def on_add_prior_invoice_charge(self):
+        customer = self.db.get_customer_by_store_name(
+            self.inv_store_name.get().strip()
+        )
+        if not customer:
+            messagebox.showerror(
+                "Customer Required",
+                "Select a saved customer before adding a prior-invoice charge."
+            )
+            return
+
+        rows = self.db.list_closed_invoice_lines_for_customer(customer[0])
+        if not rows:
+            messagebox.showinfo(
+                "No Closed Invoices",
+                "This customer has no closed invoice item lines available."
+            )
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Add Prior Invoice Charge")
+        win.transient(self)
+        win.grab_set()
+        win.geometry("900x560")
+        win.minsize(720, 440)
+
+        if hasattr(self, "_make_scrollable_popup_content"):
+            content = self._make_scrollable_popup_content(win, padding=12)
+        else:
+            content = ttk.Frame(win, padding=12)
+            content.pack(fill="both", expand=True)
+
+        ttk.Label(
+            content,
+            text="Add Charge From a Previously Closed Invoice",
+            style="Title.TLabel"
+        ).pack(anchor="w")
+        ttk.Label(
+            content,
+            text=(
+                "Select the original item, then enter only the additional amount "
+                "still owed. This does not remove inventory again."
+            ),
+            foreground="#666",
+            wraplength=820
+        ).pack(anchor="w", pady=(4, 10))
+
+        box = ttk.LabelFrame(content, text="Closed Invoice Items", padding=8)
+        box.pack(fill="both", expand=True)
+
+        cols = ("invoice", "date", "item", "qty", "type", "charged", "line_total")
+        tree = ttk.Treeview(box, columns=cols, show="headings", height=11)
+        for col, title, width, anchor in [
+            ("invoice", "Invoice", 120, "w"),
+            ("date", "Date", 130, "w"),
+            ("item", "Item", 260, "w"),
+            ("qty", "Qty", 60, "center"),
+            ("type", "Type", 70, "center"),
+            ("charged", "Charged", 100, "e"),
+            ("line_total", "Line Total", 110, "e"),
+        ]:
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor=anchor)
+
+        row_map = {}
+        for idx, row in enumerate(rows):
+            source_invoice_id, source_ref, created_at, source_line_id, item_name, qty, sale_type, unit_price, line_total = row
+            iid = f"prior_{idx}"
+            row_map[iid] = row
+            tree.insert(
+                "", "end", iid=iid,
+                values=(
+                    source_ref, str(created_at)[:10], item_name, qty,
+                    sale_type, money(unit_price), money(line_total)
+                )
+            )
+
+        scroll = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        form = ttk.LabelFrame(content, text="Additional Charge", padding=10)
+        form.pack(fill="x", pady=(10, 0))
+        form.columnconfigure(1, weight=1)
+
+        amount_var = tk.StringVar()
+        reason_var = tk.StringVar(value="Price correction")
+
+        ttk.Label(form, text="Additional amount:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(form, textvariable=amount_var, width=14).grid(row=0, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(form, text="Reason:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(form, textvariable=reason_var).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+
+        def add_charge():
+            try:
+                selected = tree.selection()
+                if not selected:
+                    raise ValueError("Select an item from a closed invoice.")
+
+                row = row_map[selected[0]]
+                source_invoice_id, source_ref, created_at, source_line_id, item_name, qty, sale_type, unit_price, line_total = row
+
+                amount = float(amount_var.get())
+                if amount <= 0:
+                    raise ValueError("Additional amount must be greater than zero.")
+
+                reason = reason_var.get().strip() or "Price correction"
+                self.invoice_adjustments.append((
+                    int(source_invoice_id),
+                    int(source_line_id),
+                    str(source_ref),
+                    str(item_name),
+                    amount,
+                    reason,
+                ))
+                self.refresh_invoice_adjustments()
+                win.destroy()
+            except Exception as exc:
+                messagebox.showerror("Error", str(exc), parent=win)
+
+        buttons = ttk.Frame(content)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Add Charge", style="Big.TButton", command=add_charge).pack(side="right")
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=8)
+
+    def on_remove_prior_invoice_charge(self):
+        selected = self.inv_adjustments_tree.selection()
+        if not selected:
+            messagebox.showerror("Error", "Select an additional charge to remove.")
+            return
+        index = self.inv_adjustments_tree.index(selected[0])
+        del self.invoice_adjustments[index]
+        self.refresh_invoice_adjustments()
+
+    def refresh_invoice_adjustments(self):
+        if not hasattr(self, "inv_adjustments_tree"):
+            return
+        for row in self.inv_adjustments_tree.get_children():
+            self.inv_adjustments_tree.delete(row)
+
+        for adjustment in self.invoice_adjustments:
+            source_invoice_id, source_line_id, source_ref, item_name, amount, reason = adjustment
+            self.inv_adjustments_tree.insert(
+                "", "end",
+                values=(source_ref, item_name, reason, money(amount))
+            )
+        self._refresh_invoice_total_labels()
+
     def on_add_invoice_line(self):
         try:
             item_name=self.inv_item.get(); item_id=self._selected_item_id(item_name); qty=int(self.inv_qty.get()); sale_type=self.inv_sale_type.get()
@@ -2087,9 +3274,198 @@ class App(tk.Tk):
 
     def _invoice_totals(self):
         subtotal=sum(price*qty for _id,_name,qty,_type,_units,_upb,_base,_surcharge,price,_pricing,_reason in self.invoice_lines)
+        adjustment_total=sum(float(row[4]) for row in self.invoice_adjustments)
+        subtotal += adjustment_total
         discount_percent=float(self.inv_discount.get() or 0); credit=float(self.inv_credit.get() or 0)
         if discount_percent<0 or credit<0: raise ValueError("Discount and credit must be >= 0.")
         discount_amount=subtotal*(discount_percent/100); return subtotal,discount_percent,discount_amount,credit,max(0,subtotal-discount_amount-credit)
+
+    def on_combined_invoice_payment(self):
+        customer_name = self.inv_store_name.get().strip()
+        customer = self.db.get_customer_by_store_name(customer_name)
+
+        if not customer:
+            messagebox.showerror(
+                "Customer Required",
+                "Select a saved customer before combining invoice payments."
+            )
+            return
+
+        rows = self.db.list_open_invoices_for_customer(customer[0])
+        if len(rows) < 2:
+            messagebox.showinfo(
+                "Combined Payment",
+                "This customer needs at least two open invoices to use combined payment."
+            )
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Combined Payment — {customer_name}")
+        win.transient(self)
+        win.grab_set()
+        win.geometry("820x560")
+        win.minsize(680, 440)
+
+        if hasattr(self, "_make_scrollable_popup_content"):
+            content = self._make_scrollable_popup_content(win, padding=12)
+        else:
+            content = ttk.Frame(win, padding=12)
+            content.pack(fill="both", expand=True)
+
+        ttk.Label(
+            content,
+            text=f"Combined Payment — {customer_name}",
+            style="Title.TLabel"
+        ).pack(anchor="w")
+        ttk.Label(
+            content,
+            text=(
+                "Select the open invoices being paid together. "
+                "Each invoice remains a separate record and reference number."
+            ),
+            foreground="#666",
+            wraplength=760,
+        ).pack(anchor="w", pady=(4, 10))
+
+        box = ttk.LabelFrame(content, text="Open Invoices", padding=8)
+        box.pack(fill="both", expand=True)
+
+        tree = ttk.Treeview(
+            box,
+            columns=("selected", "ref", "date", "total"),
+            show="headings",
+            height=12,
+        )
+        for col, title, width, anchor in [
+            ("selected", "Pay", 60, "center"),
+            ("ref", "Invoice", 170, "w"),
+            ("date", "Date", 180, "w"),
+            ("total", "Balance", 130, "e"),
+        ]:
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor=anchor)
+
+        selected_ids = set()
+        row_map = {}
+
+        for idx, (invoice_id, ref, created_at, total, store) in enumerate(rows):
+            iid = f"pay_{idx}"
+            row_map[iid] = (int(invoice_id), str(ref), float(total or 0))
+            tree.insert("", "end", iid=iid, values=("☐", ref, created_at, money(total)))
+
+        scroll = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        total_var = tk.StringVar(value="Selected total: $0.00")
+        ttk.Label(content, textvariable=total_var, style="Title.TLabel").pack(
+            anchor="e", pady=(10, 6)
+        )
+
+        payment_var = tk.StringVar(value="cash")
+        payment_row = ttk.Frame(content)
+        payment_row.pack(fill="x", pady=(0, 10))
+        ttk.Label(payment_row, text="Payment Method:").pack(side="left")
+        ttk.Combobox(
+            payment_row,
+            textvariable=payment_var,
+            state="readonly",
+            values=("cash", "check", "card", "ach", "other"),
+            width=16,
+        ).pack(side="left", padx=8)
+
+        def refresh_selected_total():
+            total = sum(row_map[iid][2] for iid in selected_ids)
+            total_var.set(
+                f"Selected invoices: {len(selected_ids)}    "
+                f"Combined total: {money(total)}"
+            )
+
+        def toggle_selected(event=None):
+            iid = tree.identify_row(event.y) if event is not None else None
+            if not iid:
+                current = tree.selection()
+                iid = current[0] if current else None
+            if not iid or iid not in row_map:
+                return
+
+            values = list(tree.item(iid, "values"))
+            if iid in selected_ids:
+                selected_ids.remove(iid)
+                values[0] = "☐"
+            else:
+                selected_ids.add(iid)
+                values[0] = "☑"
+            tree.item(iid, values=values)
+            refresh_selected_total()
+
+        tree.bind("<Double-1>", toggle_selected)
+
+        controls = ttk.Frame(content)
+        controls.pack(fill="x", pady=(4, 0))
+
+        def select_all():
+            selected_ids.clear()
+            selected_ids.update(row_map.keys())
+            for iid in row_map:
+                values = list(tree.item(iid, "values"))
+                values[0] = "☑"
+                tree.item(iid, values=values)
+            refresh_selected_total()
+
+        def clear_all():
+            selected_ids.clear()
+            for iid in row_map:
+                values = list(tree.item(iid, "values"))
+                values[0] = "☐"
+                tree.item(iid, values=values)
+            refresh_selected_total()
+
+        ttk.Button(controls, text="Select All", command=select_all).pack(side="left")
+        ttk.Button(controls, text="Clear Selection", command=clear_all).pack(side="left", padx=8)
+
+        def complete_payment():
+            try:
+                if len(selected_ids) < 2:
+                    raise ValueError("Select at least two invoices for a combined payment.")
+
+                invoice_ids = [row_map[iid][0] for iid in selected_ids]
+                payment_method = payment_var.get().strip() or "other"
+                selected_total = sum(row_map[iid][2] for iid in selected_ids)
+                refs = ", ".join(row_map[iid][1] for iid in selected_ids)
+
+                if not messagebox.askyesno(
+                    "Complete Combined Payment",
+                    f"Close {len(invoice_ids)} invoices with one payment?\n\n"
+                    f"Invoices: {refs}\n"
+                    f"Combined total: {money(selected_total)}\n"
+                    f"Payment method: {payment_method}",
+                    parent=win,
+                ):
+                    return
+
+                result = self.db.close_multiple_invoices(invoice_ids, payment_method)
+                self.refresh_all()
+                win.destroy()
+
+                messagebox.showinfo(
+                    "Combined Payment Complete",
+                    f"{result['invoice_count']} invoices were closed.\n\n"
+                    f"Combined payment: {money(result['total'])}\n"
+                    f"Payment method: {payment_method}\n\n"
+                    "Each invoice remains separate in History.",
+                )
+            except Exception as exc:
+                messagebox.showerror("Error", str(exc), parent=win)
+
+        ttk.Button(
+            controls,
+            text="Complete Combined Payment",
+            style="Big.TButton",
+            command=complete_payment,
+        ).pack(side="right")
+        ttk.Button(controls, text="Cancel", command=win.destroy).pack(side="right", padx=8)
 
     def on_save_invoice(self):
         try:
@@ -2098,8 +3474,8 @@ class App(tk.Tk):
             if not ref:
                 raise ValueError("Invoice number is required.")
 
-            if not self.invoice_lines:
-                raise ValueError("Add at least one item to the invoice list.")
+            if not self.invoice_lines and not self.invoice_adjustments:
+                raise ValueError("Add at least one item or prior-invoice charge.")
 
             # Pre-check the full invoice so duplicate item lines cannot accidentally
             # subtract more stock than is available.
@@ -2145,6 +3521,29 @@ class App(tk.Tk):
             else:
                 customer_id = self.db.save_customer(store_name, address, phone)
 
+            is_internal_use = self.db.is_internal_use_customer(customer_id)
+            if is_internal_use:
+                printable_lines = [
+                    (
+                        item_id, item_name, qty, sale_type, unit_qty, upb,
+                        0.0, 0.0, 0.0, "Internal Use", ""
+                    )
+                    for (
+                        item_id, item_name, qty, sale_type, unit_qty, upb,
+                        base_price, surcharge_amount, unit_price,
+                        pricing_type, surcharge_reason
+                    ) in printable_lines
+                ]
+                self.invoice_lines = list(printable_lines)
+                subtotal = 0.0
+                discount_percent = 0.0
+                discount_amount = 0.0
+                credit = 0.0
+                total = 0.0
+                if notes.strip():
+                    notes += "\n"
+                notes += "INTERNAL USE - inventory withdrawal, no customer charge."
+
             available_credit = self.db.get_customer_credit(customer_id)
             if credit > available_credit + 0.005:
                 raise ValueError(
@@ -2156,7 +3555,7 @@ class App(tk.Tk):
 
             printable_path = self.create_printable_invoice(
                 ref, printable_lines, self.inv_store_name.get(), self.inv_address.get(),
-                self.inv_phone.get(), discount_percent, discount_amount, credit, subtotal, total, notes
+                self.inv_phone.get(), discount_percent, discount_amount, credit, subtotal, total, notes, self.invoice_adjustments
             )
 
             invoice_id = self.db.save_invoice_header(
@@ -2177,10 +3576,22 @@ class App(tk.Tk):
             for item_id, item_name, qty, sale_type, unit_qty, upb, base_price, surcharge_amount, unit_price, pricing_type, surcharge_reason in printable_lines:
                 self.db.save_invoice_line(invoice_id, item_id, item_name, qty, sale_type, unit_qty, upb, base_price, surcharge_amount, unit_price, surcharge_reason)
 
+            for (
+                source_invoice_id, source_line_id, source_ref,
+                adjustment_item_name, adjustment_amount, adjustment_reason
+            ) in self.invoice_adjustments:
+                self.db.save_invoice_adjustment(
+                    invoice_id, source_invoice_id, source_line_id, source_ref,
+                    adjustment_item_name, adjustment_amount, adjustment_reason
+                )
+
             if credit > 0:
                 self.db.adjust_customer_credit(customer_id, -credit, "APPLIED", f"Invoice {ref}", "Account credit applied to invoice")
+            if is_internal_use:
+                self.db.mark_invoice_internal_use(invoice_id)
 
             self.invoice_lines.clear()
+            self.invoice_adjustments.clear()
             self.inv_ref.set("")
             self.inv_store_name.set("")
             self.inv_address.set("")
@@ -2206,7 +3617,7 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    def create_printable_invoice(self, ref, lines, store_name, address, phone, discount_percent, discount_amount, credit, subtotal, total, notes=""):
+    def create_printable_invoice(self, ref, lines, store_name, address, phone, discount_percent, discount_amount, credit, subtotal, total, notes="", adjustments=None):
         invoice_dir = "printable_invoices"
         os.makedirs(invoice_dir, exist_ok=True)
 
@@ -2237,6 +3648,19 @@ class App(tk.Tk):
                     "</tr>"
                 )
 
+        adjustments = adjustments or []
+        for source_invoice_id, source_line_id, source_ref, item_name, amount, reason in adjustments:
+            rows_html.append(
+                "<tr>"
+                "<td></td>"
+                f"<td><strong>Prior Invoice Charge</strong><br>{escape(item_name)} — Invoice {escape(str(source_ref))}"
+                + (f"<br><span class='muted'>{escape(reason)}</span>" if reason else "")
+                + "</td>"
+                "<td class='qty'>Adjustment</td>"
+                f"<td class='money'>{money(amount)}</td>"
+                f"<td class='money'>{money(amount)}</td>"
+                "</tr>"
+            )
         customer_html = f"""
         <div class="customer">
             <h2>Customer</h2>
@@ -2439,8 +3863,15 @@ class App(tk.Tk):
         self.special_unit_price_var = tk.StringVar()
         self.special_price_type_var = tk.StringVar(value="box")
         ttk.Label(pricing_box, text="Item:").grid(row=0, column=0, sticky="w", pady=4)
-        self.special_price_item_cb = ttk.Combobox(pricing_box, textvariable=self.special_price_item_var, state="readonly")
-        self.special_price_item_cb.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
+        self.special_price_item_cb = ttk.Combobox(
+            pricing_box, textvariable=self.special_price_item_var
+        )
+        self.special_price_item_cb.grid(
+            row=0, column=1, sticky="ew", padx=(8, 0), pady=4
+        )
+        self._configure_item_autocomplete(
+            self.special_price_item_cb, self.special_price_item_var
+        )
         ttk.Label(pricing_box, text="Special Box Price:").grid(row=1,column=0,sticky="w",pady=4)
         ttk.Entry(pricing_box,textvariable=self.special_box_price_var,width=14).grid(row=1,column=1,sticky="w",padx=(8,0),pady=4)
         ttk.Label(pricing_box, text="Special Unit Price:").grid(row=2,column=0,sticky="w",pady=4)
@@ -2579,13 +4010,79 @@ class App(tk.Tk):
 
     def on_remove_special_price(self):
         try:
-            if self.customer_selected_id is None: raise ValueError("Select a customer first.")
-            item_id=self._selected_item_id(self.special_price_item_var.get())
-            choice=messagebox.askyesnocancel("Remove Special Price", "Yes removes BOX pricing.\nNo removes UNIT pricing.\nCancel does nothing.")
-            if choice is None:return
-            self.db.remove_customer_special_price(self.customer_selected_id,item_id,"box" if choice else "unit")
+            if self.customer_selected_id is None:
+                raise ValueError("Select a customer first.")
+
+            item_name = self.special_price_item_var.get().strip()
+            item_id = self._selected_item_id(item_name)
+
+            dialog = tk.Toplevel(self)
+            dialog.title("Remove Special Price")
+            dialog.transient(self)
+            dialog.grab_set()
+            dialog.resizable(False, False)
+
+            result = {"choice": None}
+
+            body = ttk.Frame(dialog, padding=18)
+            body.pack(fill="both", expand=True)
+
+            ttk.Label(
+                body,
+                text=f"Which special price would you like to remove for:\n{item_name}?",
+                justify="center",
+                wraplength=420,
+            ).pack(pady=(0, 16))
+
+            buttons = ttk.Frame(body)
+            buttons.pack(fill="x")
+
+            def choose(price_type):
+                result["choice"] = price_type
+                dialog.destroy()
+
+            ttk.Button(
+                buttons,
+                text="Remove Box Price",
+                command=lambda: choose("box"),
+            ).pack(side="left", padx=(0, 8))
+
+            ttk.Button(
+                buttons,
+                text="Remove Unit Price",
+                command=lambda: choose("unit"),
+            ).pack(side="left", padx=8)
+
+            ttk.Button(
+                buttons,
+                text="Cancel",
+                command=lambda: choose(None),
+            ).pack(side="left", padx=(8, 0))
+
+            dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+            dialog.bind("<Escape>", lambda event: choose(None))
+
+            dialog.update_idletasks()
+            width = dialog.winfo_reqwidth()
+            height = dialog.winfo_reqheight()
+            x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+            y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+            dialog.geometry(f"+{x}+{y}")
+
+            self.wait_window(dialog)
+
+            if result["choice"] is None:
+                return
+
+            self.db.remove_customer_special_price(
+                self.customer_selected_id,
+                item_id,
+                result["choice"],
+            )
             self.refresh_customer_special_prices(self.customer_selected_id)
-        except Exception as e: messagebox.showerror("Error",str(e))
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
     def on_add_managed_customer(self):
         try:
@@ -2864,8 +4361,9 @@ class App(tk.Tk):
         detail_y = max((screen_height - detail_height) // 2, 0)
         win.geometry(f"{detail_width}x{detail_height}+{detail_x}+{detail_y}")
         win.minsize(min(760, screen_width), min(560, screen_height))
+        detail_content = self._make_scrollable_popup_content(win, padding=0)
 
-        summary = ttk.LabelFrame(win, text="Invoice Details", padding=12)
+        summary = ttk.LabelFrame(detail_content, text="Invoice Details", padding=12)
         summary.pack(fill="x", padx=12, pady=12)
 
         row1 = ttk.Frame(summary); row1.pack(fill="x", pady=3)
@@ -2880,7 +4378,7 @@ class App(tk.Tk):
         row3 = ttk.Frame(summary); row3.pack(fill="x", pady=3)
         ttk.Label(row3, text=f"Address: {address or 'Not provided'}").pack(side="left")
 
-        lines_box = ttk.LabelFrame(win, text="Invoice Lines", padding=12)
+        lines_box = ttk.LabelFrame(detail_content, text="Invoice Lines", padding=12)
         lines_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
         cols = ("item", "qty", "price", "line_total")
@@ -2893,7 +4391,12 @@ class App(tk.Tk):
         lines_tree.column("qty", width=90, anchor="center")
         lines_tree.column("price", width=120, anchor="e")
         lines_tree.column("line_total", width=130, anchor="e")
-        lines_tree.pack(fill="both", expand=True)
+        lines_scroll = ttk.Scrollbar(
+            lines_box, orient="vertical", command=lines_tree.yview
+        )
+        lines_tree.configure(yscrollcommand=lines_scroll.set)
+        lines_tree.pack(side="left", fill="both", expand=True)
+        lines_scroll.pack(side="right", fill="y")
 
         for item_name, qty, sale_type, base_price, surcharge_amount, surcharge_reason, unit_price, line_total in self.db.get_invoice_lines(invoice_id):
             price_text = money(unit_price)
@@ -2901,7 +4404,7 @@ class App(tk.Tk):
                 price_text += f" (includes {money(surcharge_amount)} surcharge)"
             lines_tree.insert("", "end", values=(item_name, f"{qty} {sale_type}(s)", price_text, money(line_total)))
 
-        totals_box = ttk.LabelFrame(win, text="Totals / Payment", padding=12)
+        totals_box = ttk.LabelFrame(detail_content, text="Totals / Payment", padding=12)
         totals_box.pack(fill="x", padx=12, pady=(0, 12))
 
         totals_row = ttk.Frame(totals_box); totals_row.pack(fill="x", pady=4)
@@ -2924,11 +4427,30 @@ class App(tk.Tk):
         if status == "closed":
             ttk.Label(payment_row, text=f"Closed/Paid: {paid_at}", foreground="#666").pack(side="left", padx=12)
 
-        note_box = ttk.LabelFrame(win, text="Notes", padding=12)
+        note_box = ttk.LabelFrame(detail_content, text="Notes", padding=12)
         note_box.pack(fill="x", padx=12, pady=(0, 12))
         ttk.Label(note_box, text=notes if notes else "No notes entered.", wraplength=760).pack(anchor="w")
 
         # Dock detail-window buttons to the bottom so payment/void actions stay visible.
+        saved_adjustments = self.db.get_invoice_adjustments(invoice_id)
+        if saved_adjustments:
+            adj_parent = detail_content if "detail_content" in locals() else win
+            adj_box = ttk.LabelFrame(
+                adj_parent, text="Prior Invoice Charges", padding=12
+            )
+            adj_box.pack(fill="x", padx=12, pady=(0, 8))
+
+            for (
+                adjustment_id, source_invoice_id, source_line_id,
+                source_ref, item_name, amount, reason, adjustment_created
+            ) in saved_adjustments:
+                text_value = f"{item_name} — from invoice {source_ref}: {money(amount)}"
+                if reason:
+                    text_value += f" ({reason})"
+                ttk.Label(adj_box, text=text_value, wraplength=820).pack(
+                    anchor="w", pady=2
+                )
+
         buttons = ttk.Frame(win, padding=12)
         buttons.pack(side="bottom", fill="x")
 
@@ -2947,14 +4469,51 @@ class App(tk.Tk):
 
         def void_invoice():
             if status == "closed":
-                messagebox.showerror("Error", "Closed invoices cannot be voided.")
+                messagebox.showerror(
+                    "Error",
+                    "Closed invoices cannot be voided.",
+                    parent=win,
+                )
                 return
-            if not messagebox.askyesno("Void Invoice", "Mark this invoice as void?\n\nThis does not restore inventory; it only marks the invoice record as void."):
+
+            if status == "void":
+                messagebox.showinfo(
+                    "Already Voided",
+                    "This invoice has already been voided.",
+                    parent=win,
+                )
                 return
-            self.db.void_invoice(invoice_id)
-            messagebox.showinfo("Voided", "Invoice marked as void.")
-            win.destroy()
-            self.refresh_transactions()
+
+            if not messagebox.askyesno(
+                "Void Open Invoice",
+                "Void this open invoice?\n\n"
+                "This will return all items on the invoice to inventory. "
+                "Any customer account credit still applied to the invoice "
+                "will also be restored.\n\n"
+                "This action cannot be undone from this screen.",
+                parent=win,
+            ):
+                return
+
+            try:
+                result = self.db.void_invoice(invoice_id)
+                self.refresh_all()
+
+                message = (
+                    "Invoice marked as void.\n\n"
+                    f"Inventory restored: {result['restored_units']} unit(s)."
+                )
+                if result["restored_credit"] > 0:
+                    message += (
+                        "\nCustomer credit restored: "
+                        f"{money(result['restored_credit'])}."
+                    )
+
+                messagebox.showinfo("Invoice Voided", message, parent=win)
+                win.destroy()
+
+            except Exception as e:
+                messagebox.showerror("Error", str(e), parent=win)
 
         def open_printable():
             if printable_path and os.path.exists(printable_path):
@@ -2963,9 +4522,251 @@ class App(tk.Tk):
                 messagebox.showerror("Error", "Printable invoice file was not found.")
 
         ttk.Button(buttons, text="Save Payment / Close Invoice", style="Big.TButton", command=save_payment).pack(side="left")
+        if status == "open":
+            ttk.Button(
+                buttons, text="Edit Open Invoice", style="Big.TButton",
+                command=lambda: (win.destroy(), self.open_invoice_editor(invoice_id)),
+            ).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Open Printable Invoice", style="Big.TButton", command=open_printable).pack(side="left", padx=8)
         ttk.Button(buttons, text="Void Invoice", style="Big.TButton", command=void_invoice).pack(side="left", padx=8)
         ttk.Button(buttons, text="Close Window", style="Big.TButton", command=win.destroy).pack(side="right")
+
+    def open_invoice_editor(self, invoice_id):
+        invoice = self.db.get_invoice(invoice_id)
+        if not invoice:
+            messagebox.showerror("Error", "Invoice not found.")
+            return
+
+        (
+            _id, ref, store, address, phone, discount_percent, credit, notes,
+            subtotal, discount_amount, total, status, payment_method,
+            printable_path, created_at, paid_at
+        ) = invoice
+
+        if status != "open":
+            messagebox.showerror("Error", "Only open invoices can be edited.")
+            return
+
+        customer_id = self.db.get_invoice_customer_id(invoice_id)
+        edit_lines = []
+        for (
+            line_id, item_id, item_name, qty, sale_type, unit_qty,
+            units_per_box, base_price, surcharge_amount, surcharge_reason,
+            unit_price, line_total
+        ) in self.db.get_invoice_lines_for_edit(invoice_id):
+            edit_lines.append((
+                item_id, item_name, qty, sale_type, unit_qty, units_per_box,
+                base_price, surcharge_amount, unit_price, "saved", surcharge_reason
+            ))
+
+        win = tk.Toplevel(self)
+        win.title(f"Edit Open Invoice {ref}")
+        win.transient(self)
+        win.grab_set()
+        win.geometry("1000x650")
+        win.minsize(760, 480)
+
+        content = self._make_scrollable_popup_content(win, padding=12)
+
+        ttk.Label(
+            content, text=f"Edit Open Invoice #{ref} — {store}", style="Title.TLabel"
+        ).pack(anchor="w", pady=(0, 6))
+        ttk.Label(
+            content,
+            text="Add, replace, modify, or remove invoice items. Inventory is adjusted only by the difference.",
+            foreground="#666", wraplength=900
+        ).pack(anchor="w", pady=(0, 12))
+
+        form = ttk.LabelFrame(content, text="Add / Modify Item", padding=12)
+        form.pack(fill="x", pady=(0, 10))
+        form.columnconfigure(1, weight=1)
+
+        item_var = tk.StringVar()
+        qty_var = tk.StringVar()
+        sale_type_var = tk.StringVar(value="box")
+        selected_index = {"value": None}
+
+        ttk.Label(form, text="Item:").grid(row=0, column=0, sticky="w")
+        item_cb = ttk.Combobox(
+            form, textvariable=item_var,
+            values=[row[1] for row in self.db.list_items("")]
+        )
+        item_cb.grid(row=0, column=1, sticky="ew", padx=8)
+        if hasattr(self, "_configure_item_autocomplete"):
+            self._configure_item_autocomplete(item_cb, item_var)
+
+        ttk.Label(form, text="Qty:").grid(row=0, column=2, sticky="w")
+        ttk.Entry(form, textvariable=qty_var, width=10).grid(row=0, column=3, padx=8)
+        ttk.Combobox(
+            form, textvariable=sale_type_var, state="readonly",
+            values=("box", "unit"), width=9
+        ).grid(row=0, column=4, padx=(0, 8))
+
+        table_box = ttk.LabelFrame(content, text="Invoice Items", padding=10)
+        table_box.pack(fill="both", expand=True, pady=(0, 10))
+
+        columns = ("item", "qty", "type", "units", "price", "total")
+        tree = ttk.Treeview(table_box, columns=columns, show="headings", height=13)
+        for col, title, width, anchor in [
+            ("item", "Item", 360, "w"),
+            ("qty", "Qty", 80, "center"),
+            ("type", "Sold As", 90, "center"),
+            ("units", "Stock Units", 100, "center"),
+            ("price", "Charged Price", 120, "e"),
+            ("total", "Line Total", 120, "e"),
+        ]:
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor=anchor)
+
+        scroll = ttk.Scrollbar(table_box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        totals_var = tk.StringVar()
+
+        def refresh_editor():
+            for row in tree.get_children():
+                tree.delete(row)
+            running = 0.0
+            for idx, line in enumerate(edit_lines):
+                item_id, item_name, qty, sale_type, unit_qty, upb, base_price, surcharge_amount, charged_price, pricing_type, surcharge_reason = line
+                line_total = float(charged_price) * int(qty)
+                running += line_total
+                tree.insert(
+                    "", "end", iid=str(idx),
+                    values=(item_name, qty, sale_type, unit_qty, money(charged_price), money(line_total))
+                )
+            discount_value = running * (float(discount_percent or 0) / 100.0)
+            usable_credit = min(float(credit or 0), max(0.0, running - discount_value))
+            final_total = max(0.0, running - discount_value - usable_credit)
+            totals_var.set(
+                f"Subtotal: {money(running)}    Discount: {money(discount_value)}    "
+                f"Credit: {money(usable_credit)}    Total: {money(final_total)}"
+            )
+
+        def clear_form():
+            selected_index["value"] = None
+            item_var.set("")
+            qty_var.set("")
+            sale_type_var.set("box")
+            for row in tree.selection():
+                tree.selection_remove(row)
+
+        def load_selected(event=None):
+            selected = tree.selection()
+            if not selected:
+                return
+            idx = int(selected[0])
+            selected_index["value"] = idx
+            line = edit_lines[idx]
+            item_var.set(line[1])
+            qty_var.set(str(line[2]))
+            sale_type_var.set(line[3])
+
+        def add_or_update():
+            try:
+                item_name = item_var.get().strip()
+                item_id = self._selected_item_id(item_name)
+                qty = int(qty_var.get())
+                sale_type = sale_type_var.get()
+                if qty <= 0:
+                    raise ValueError("Quantity must be greater than zero.")
+
+                base_price, surcharge_amount, charged_price, pricing_type, surcharge_reason = self.db.get_invoice_price_details(
+                    customer_id, item_id, sale_type
+                )
+                item = self.db.get_item_details(item_id)
+                upb = int(item[4])
+                unit_qty = qty * (upb if sale_type == "box" else 1)
+
+                new_line = (
+                    item_id, item_name, qty, sale_type, unit_qty, upb,
+                    base_price, surcharge_amount, charged_price, pricing_type, surcharge_reason
+                )
+
+                idx = selected_index["value"]
+                if idx is None:
+                    edit_lines.append(new_line)
+                else:
+                    edit_lines[idx] = new_line
+
+                clear_form()
+                refresh_editor()
+            except Exception as exc:
+                messagebox.showerror("Error", str(exc), parent=win)
+
+        def remove_selected():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showerror("Error", "Select an invoice item first.", parent=win)
+                return
+            del edit_lines[int(selected[0])]
+            clear_form()
+            refresh_editor()
+
+        def save_changes():
+            try:
+                if not edit_lines:
+                    raise ValueError(
+                        "An invoice must contain at least one item. Use Void Invoice if the order was cancelled."
+                    )
+                if not messagebox.askyesno(
+                    "Save Invoice Changes",
+                    "Save these item changes and adjust inventory?",
+                    parent=win
+                ):
+                    return
+
+                new_subtotal, new_discount_amount, new_credit, new_total = self.db.update_open_invoice_lines(
+                    invoice_id, edit_lines
+                )
+
+                new_printable = self.create_printable_invoice(
+                    ref, list(edit_lines), store, address, phone,
+                    discount_percent, new_discount_amount, new_credit,
+                    new_subtotal, new_total, notes
+                )
+                self.db.update_invoice_printable_path(invoice_id, new_printable)
+
+                self.refresh_all()
+                win.destroy()
+                messagebox.showinfo(
+                    "Invoice Updated",
+                    "The open invoice and inventory were updated successfully."
+                )
+                self.open_transaction_detail(invoice_id)
+            except Exception as exc:
+                messagebox.showerror("Error", str(exc), parent=win)
+
+        tree.bind("<<TreeviewSelect>>", load_selected)
+        tree.bind("<Double-1>", load_selected)
+
+        form_buttons = ttk.Frame(form)
+        form_buttons.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        ttk.Button(
+            form_buttons, text="Add / Update Line",
+            style="Big.TButton", command=add_or_update
+        ).pack(side="left")
+        ttk.Button(
+            form_buttons, text="Clear Selection", command=clear_form
+        ).pack(side="left", padx=8)
+
+        actions = ttk.Frame(content)
+        actions.pack(fill="x")
+        ttk.Button(
+            actions, text="Remove Selected Item", command=remove_selected
+        ).pack(side="left")
+        ttk.Label(actions, textvariable=totals_var, style="Title.TLabel").pack(
+            side="left", padx=18
+        )
+        ttk.Button(
+            actions, text="Save Invoice Changes",
+            style="Big.TButton", command=save_changes
+        ).pack(side="right")
+        ttk.Button(actions, text="Cancel", command=win.destroy).pack(side="right", padx=8)
+
+        refresh_editor()
 
     # ---------- Statements Tab ----------
     def _build_statements_tab(self):
@@ -3272,41 +5073,354 @@ class App(tk.Tk):
 
     # ---------- History Tab ----------
     def _build_history_tab(self):
-        top = ttk.Frame(self.tab_history)
-        top.pack(fill="x", pady=(0, 10))
-        ttk.Button(top, text="Refresh", style="Big.TButton", command=self.refresh_history).pack(side="left")
-        ttk.Button(top, text="Export History CSV", style="Big.TButton",
-                   command=lambda: self.export_treeview_csv(self.hist, "history")).pack(side="left", padx=8)
-        ttk.Label(top, text="Shows last 200 transactions (shipments/invoices).", foreground="#666").pack(side="left", padx=12)
+        self.history_search_var = tk.StringVar()
+        self.history_type_var = tk.StringVar(value="All")
+        self.history_status_var = tk.StringVar(value="All")
+        self.history_from_var = tk.StringVar()
+        self.history_to_var = tk.StringVar()
+        self.history_record_map = {}
+
+        filters = ttk.LabelFrame(self.tab_history, text="History Filters", padding=10)
+        filters.pack(fill="x", pady=(0, 10))
+        filters.columnconfigure(1, weight=1)
+
+        ttk.Label(filters, text="Search:").grid(row=0, column=0, sticky="w")
+        search_entry = ttk.Entry(filters, textvariable=self.history_search_var)
+        search_entry.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+        search_entry.bind("<Return>", lambda event: self.refresh_history())
+
+        ttk.Label(filters, text="Type:").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(
+            filters,
+            textvariable=self.history_type_var,
+            state="readonly",
+            width=16,
+            values=("All", "Shipment", "Invoice", "Internal Use", "Refund"),
+        ).grid(row=0, column=3, padx=(6, 12))
+
+        ttk.Label(filters, text="Status:").grid(row=0, column=4, sticky="w")
+        ttk.Combobox(
+            filters,
+            textvariable=self.history_status_var,
+            state="readonly",
+            width=14,
+            values=("All", "Open", "Closed", "Void", "Completed", "Corrected"),
+        ).grid(row=0, column=5, padx=(6, 0))
+
+        ttk.Label(filters, text="From:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(
+            filters, textvariable=self.history_from_var, width=14
+        ).grid(row=1, column=1, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(filters, text="To:").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(
+            filters, textvariable=self.history_to_var, width=14
+        ).grid(row=1, column=3, sticky="w", padx=(6, 12), pady=(8, 0))
+
+        ttk.Label(
+            filters, text="YYYY-MM-DD", foreground="#666"
+        ).grid(row=1, column=4, sticky="w", pady=(8, 0))
+
+        actions = ttk.Frame(self.tab_history)
+        actions.pack(fill="x", pady=(0, 10))
+        ttk.Button(
+            actions, text="Apply Filters", style="Big.TButton",
+            command=self.refresh_history
+        ).pack(side="left")
+        ttk.Button(
+            actions, text="Clear Filters", command=self.clear_history_filters
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            actions, text="Open Selected", style="Big.TButton",
+            command=self.on_open_history_record
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            actions, text="View Raw Inventory Log",
+            command=self.open_raw_inventory_log
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            actions, text="Export History CSV",
+            command=lambda: self.export_treeview_csv(self.hist, "history")
+        ).pack(side="left", padx=8)
+
+        ttk.Label(
+            actions,
+            text="One row per invoice, shipment, internal-use withdrawal, or refund.",
+            foreground="#666",
+        ).pack(side="left", padx=12)
 
         table_frame = ttk.Frame(self.tab_history)
         table_frame.pack(fill="both", expand=True)
 
-        cols = ("time", "type", "ref", "item", "change", "note")
-        self.hist = ttk.Treeview(table_frame, columns=cols, show="headings", height=14)
-        for c, title, w in [
-            ("time", "Time", 160),
-            ("type", "Type", 100),
-            ("ref", "Ref #", 140),
-            ("item", "Item", 250),
-            ("change", "Qty Change", 110),
-            ("note", "Note", 260),
+        cols = ("time", "type", "ref", "party", "summary", "status")
+        self.hist = ttk.Treeview(
+            table_frame, columns=cols, show="headings", height=16
+        )
+        for col, title, width, anchor in [
+            ("time", "Date / Time", 160, "w"),
+            ("type", "Type", 110, "center"),
+            ("ref", "Reference", 150, "w"),
+            ("party", "Customer / Source", 230, "w"),
+            ("summary", "Summary", 300, "w"),
+            ("status", "Status", 110, "center"),
         ]:
-            self.hist.heading(c, text=title)
-            self.hist.column(c, width=w)
+            self.hist.heading(col, text=title)
+            self.hist.column(col, width=width, anchor=anchor)
 
-        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.hist.yview)
+        vsb = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.hist.yview
+        )
         self.hist.configure(yscrollcommand=vsb.set)
         self.hist.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
+        self.hist.bind("<Double-1>", self.on_open_history_record)
+
+    def clear_history_filters(self):
+        self.history_search_var.set("")
+        self.history_type_var.set("All")
+        self.history_status_var.set("All")
+        self.history_from_var.set("")
+        self.history_to_var.set("")
+        self.refresh_history()
+
     def refresh_history(self):
         for row in self.hist.get_children():
             self.hist.delete(row)
+        self.history_record_map = {}
 
-        rows = self.db.list_history(limit=200)
-        for created_at, typ, ref, item_name, qty_change, note in rows:
-            self.hist.insert("", "end", values=(created_at, typ, ref, item_name, qty_change, note))
+        search = self.history_search_var.get().strip().casefold()
+        wanted_type = self.history_type_var.get().strip()
+        wanted_status = self.history_status_var.get().strip()
+        from_text = self.history_from_var.get().strip()
+        to_text = self.history_to_var.get().strip()
+
+        try:
+            from_date = (
+                datetime.strptime(from_text, "%Y-%m-%d").date()
+                if from_text else None
+            )
+            to_date = (
+                datetime.strptime(to_text, "%Y-%m-%d").date()
+                if to_text else None
+            )
+            if from_date and to_date and from_date > to_date:
+                raise ValueError("From date cannot be later than To date.")
+        except ValueError as exc:
+            messagebox.showerror(
+                "Invalid History Date",
+                "Use YYYY-MM-DD for History dates.\n\n" + str(exc),
+            )
+            return
+
+        displayed = 0
+        for key, created_at, typ, ref, party, summary, status in self.db.list_document_history(1000):
+            if wanted_type != "All" and typ != wanted_type:
+                continue
+            if wanted_status != "All" and status != wanted_status:
+                continue
+
+            if search:
+                haystack = " ".join(
+                    str(value or "")
+                    for value in (created_at, typ, ref, party, summary, status)
+                ).casefold()
+                if search not in haystack:
+                    continue
+
+            if from_date or to_date:
+                try:
+                    row_date = datetime.strptime(
+                        str(created_at)[:10], "%Y-%m-%d"
+                    ).date()
+                except ValueError:
+                    row_date = None
+                if row_date:
+                    if from_date and row_date < from_date:
+                        continue
+                    if to_date and row_date > to_date:
+                        continue
+
+            iid = f"history_{displayed}"
+            self.history_record_map[iid] = key
+            self.hist.insert(
+                "", "end", iid=iid,
+                values=(created_at, typ, ref, party, summary, status)
+            )
+            displayed += 1
+            if displayed >= 500:
+                break
+
+    def on_open_history_record(self, event=None):
+        selected = self.hist.selection()
+        if not selected:
+            if event is None:
+                messagebox.showerror("Error", "Select a history record first.")
+            return
+
+        key = self.history_record_map.get(selected[0], "")
+        if not key:
+            return
+
+        kind, value = key.split(":", 1)
+
+        if kind == "invoice":
+            self.open_transaction_detail(int(value))
+        elif kind == "shipment":
+            if hasattr(self, "open_shipment_detail"):
+                self.open_shipment_detail(value)
+            else:
+                messagebox.showinfo(
+                    "Shipment",
+                    "Detailed shipment viewing is not available in this build."
+                )
+        elif kind == "refund":
+            self.open_refund_history_detail(int(value))
+
+    def open_refund_history_detail(self, refund_id):
+        header, lines = self.db.get_refund_history_detail(refund_id)
+        if not header:
+            messagebox.showerror("Error", "Refund record not found.")
+            return
+
+        (
+            _refund_id, created_at, refund_method, total, note,
+            invoice_id, invoice_ref, store
+        ) = header
+
+        win = tk.Toplevel(self)
+        win.title(f"Refund #{refund_id}")
+        win.transient(self)
+        win.geometry("760x500")
+        win.minsize(620, 380)
+
+        content = ttk.Frame(win, padding=12)
+        content.pack(fill="both", expand=True)
+
+        ttk.Label(
+            content, text=f"Refund #{refund_id}", style="Title.TLabel"
+        ).pack(anchor="w")
+        ttk.Label(
+            content,
+            text=(
+                f"Date: {created_at}    Customer: {store or '—'}    "
+                f"Invoice: {invoice_ref or '—'}"
+            ),
+        ).pack(anchor="w", pady=(4, 2))
+        ttk.Label(
+            content,
+            text=f"Method: {refund_method}    Total: {money(total)}",
+        ).pack(anchor="w", pady=(0, 8))
+        if note:
+            ttk.Label(
+                content, text=f"Note: {note}", wraplength=700
+            ).pack(anchor="w", pady=(0, 8))
+
+        box = ttk.LabelFrame(content, text="Returned Items", padding=8)
+        box.pack(fill="both", expand=True)
+
+        tree = ttk.Treeview(
+            box,
+            columns=("item", "qty", "price", "total"),
+            show="headings",
+            height=10,
+        )
+        for col, title, width, anchor in [
+            ("item", "Item", 360, "w"),
+            ("qty", "Qty", 80, "center"),
+            ("price", "Unit Price", 110, "e"),
+            ("total", "Line Total", 110, "e"),
+        ]:
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor=anchor)
+
+        for item_name, qty, unit_price, line_total in lines:
+            tree.insert(
+                "", "end",
+                values=(item_name, qty, money(unit_price), money(line_total))
+            )
+
+        scroll = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        buttons = ttk.Frame(content)
+        buttons.pack(fill="x", pady=(10, 0))
+        if invoice_id:
+            ttk.Button(
+                buttons,
+                text="Open Original Invoice",
+                command=lambda: (
+                    win.destroy(),
+                    self.open_transaction_detail(int(invoice_id))
+                ),
+            ).pack(side="left")
+        ttk.Button(
+            buttons, text="Close", command=win.destroy
+        ).pack(side="right")
+
+    def open_raw_inventory_log(self):
+        win = tk.Toplevel(self)
+        win.title("Raw Inventory Log")
+        win.transient(self)
+        win.geometry("1050x620")
+        win.minsize(760, 420)
+
+        outer = ttk.Frame(win, padding=12)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(
+            outer,
+            text="Raw Inventory Movement Log",
+            style="Title.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text=(
+                "Low-level item movements used for inventory auditing. "
+                "This includes shipment/invoice adjustments and reversals."
+            ),
+            foreground="#666",
+            wraplength=980,
+        ).pack(anchor="w", pady=(4, 10))
+
+        table = ttk.Frame(outer)
+        table.pack(fill="both", expand=True)
+
+        cols = ("time", "type", "ref", "item", "change", "note")
+        raw_tree = ttk.Treeview(
+            table, columns=cols, show="headings", height=16
+        )
+        for col, title, width, anchor in [
+            ("time", "Time", 155, "w"),
+            ("type", "Type", 90, "center"),
+            ("ref", "Reference", 135, "w"),
+            ("item", "Item", 235, "w"),
+            ("change", "Qty Change", 100, "center"),
+            ("note", "Note", 300, "w"),
+        ]:
+            raw_tree.heading(col, text=title)
+            raw_tree.column(col, width=width, anchor=anchor)
+
+        for row in self.db.list_history(limit=1000):
+            raw_tree.insert("", "end", values=row)
+
+        vsb = ttk.Scrollbar(table, orient="vertical", command=raw_tree.yview)
+        raw_tree.configure(yscrollcommand=vsb.set)
+        raw_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(10, 0))
+        ttk.Button(
+            actions,
+            text="Export Raw Log CSV",
+            command=lambda: self.export_treeview_csv(raw_tree, "raw_inventory_log"),
+        ).pack(side="left")
+        ttk.Button(
+            actions, text="Close", command=win.destroy
+        ).pack(side="right")
 
     def export_treeview_csv(self, tree, default_name):
         """Export the currently displayed rows of a Treeview to a CSV file."""
@@ -3350,6 +5464,192 @@ class App(tk.Tk):
         self.refresh_customer_dropdowns()
         self.refresh_special_price_item_choices()
         self._update_hints()
+
+    def _configure_item_autocomplete(self, combo, variable, filter_inventory=False):
+        combo._item_filter_inventory = bool(filter_inventory)
+
+        combo.bind(
+            "<KeyRelease>",
+            lambda event, c=combo, v=variable: self._autocomplete_keyrelease(c, v, event),
+        )
+        combo.bind(
+            "<Down>",
+            lambda event, c=combo, v=variable: self._autocomplete_move(c, v, 1),
+        )
+        combo.bind(
+            "<Up>",
+            lambda event, c=combo, v=variable: self._autocomplete_move(c, v, -1),
+        )
+        combo.bind(
+            "<Return>",
+            lambda event, c=combo, v=variable: self._autocomplete_accept(c, v),
+        )
+        combo.bind("<Escape>", lambda event: self._hide_item_suggestions())
+
+    def _ensure_item_suggestion_popup(self):
+        popup = getattr(self, "_item_suggestion_popup", None)
+        if popup is not None and popup.winfo_exists():
+            return
+
+        popup = tk.Toplevel(self)
+        popup.withdraw()
+        popup.overrideredirect(True)
+
+        frame = ttk.Frame(popup, relief="solid", borderwidth=1)
+        frame.pack(fill="both", expand=True)
+
+        listbox = tk.Listbox(
+            frame,
+            exportselection=False,
+            activestyle="dotbox",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        listbox.bind("<ButtonRelease-1>", self._autocomplete_click)
+
+        self._item_suggestion_popup = popup
+        self._item_suggestion_list = listbox
+        self._item_suggestion_combo = None
+        self._item_suggestion_variable = None
+
+    def _autocomplete_keyrelease(self, combo, variable, event=None):
+        if event and event.keysym in {
+            "Up", "Down", "Return", "Escape", "Tab",
+            "Left", "Right", "Home", "End",
+        }:
+            return
+
+        typed = variable.get().strip()
+        matches = self.db.list_items(typed)
+        names = [row[1] for row in matches[:50]]
+        combo["values"] = names
+
+        if getattr(combo, "_item_filter_inventory", False):
+            self.refresh_inventory()
+
+        if typed and names:
+            self._show_item_suggestions(combo, variable, names)
+        else:
+            self._hide_item_suggestions()
+
+    def _show_item_suggestions(self, combo, variable, names):
+        self._ensure_item_suggestion_popup()
+
+        popup = self._item_suggestion_popup
+        listbox = self._item_suggestion_list
+        self._item_suggestion_combo = combo
+        self._item_suggestion_variable = variable
+
+        listbox.delete(0, "end")
+        for name in names:
+            listbox.insert("end", name)
+
+        if names:
+            listbox.selection_clear(0, "end")
+            listbox.selection_set(0)
+            listbox.activate(0)
+
+        combo.update_idletasks()
+
+        width = max(combo.winfo_width(), 220)
+        rows = min(len(names), 8)
+        height = rows * 22 + 4
+        x = combo.winfo_rootx()
+        y = combo.winfo_rooty() + combo.winfo_height()
+
+        if y + height > self.winfo_screenheight():
+            y = combo.winfo_rooty() - height
+
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+        popup.deiconify()
+        popup.lift()
+
+        # Keep keyboard focus in the item box while suggestions stay visible.
+        combo.focus_set()
+
+    def _autocomplete_move(self, combo, variable, direction):
+        self._ensure_item_suggestion_popup()
+
+        if (
+            self._item_suggestion_popup.state() == "withdrawn"
+            or self._item_suggestion_combo is not combo
+        ):
+            typed = variable.get().strip()
+            names = [row[1] for row in self.db.list_items(typed)[:50]]
+            if names:
+                self._show_item_suggestions(combo, variable, names)
+            return "break"
+
+        lb = self._item_suggestion_list
+        if lb.size() == 0:
+            return "break"
+
+        selected = lb.curselection()
+        current = selected[0] if selected else 0
+        target = max(0, min(lb.size() - 1, current + direction))
+
+        lb.selection_clear(0, "end")
+        lb.selection_set(target)
+        lb.activate(target)
+        lb.see(target)
+        return "break"
+
+    def _autocomplete_accept(self, combo, variable):
+        popup = getattr(self, "_item_suggestion_popup", None)
+        if popup is None or popup.state() == "withdrawn":
+            return
+
+        if self._item_suggestion_combo is not combo:
+            return
+
+        selected = self._item_suggestion_list.curselection()
+        if not selected:
+            return "break"
+
+        name = self._item_suggestion_list.get(selected[0])
+        self._choose_item_suggestion(combo, variable, name)
+        return "break"
+
+    def _autocomplete_click(self, event=None):
+        combo = getattr(self, "_item_suggestion_combo", None)
+        variable = getattr(self, "_item_suggestion_variable", None)
+        if combo is None or variable is None:
+            return
+
+        selected = self._item_suggestion_list.curselection()
+        if not selected:
+            return
+
+        name = self._item_suggestion_list.get(selected[0])
+        self._choose_item_suggestion(combo, variable, name)
+
+    def _choose_item_suggestion(self, combo, variable, name):
+        variable.set(name)
+        self._hide_item_suggestions()
+        combo.focus_set()
+
+        try:
+            combo.icursor("end")
+        except tk.TclError:
+            pass
+
+        if getattr(combo, "_item_filter_inventory", False):
+            self.refresh_inventory()
+            self.on_inventory_search_selected()
+
+    def _hide_item_suggestions(self):
+        popup = getattr(self, "_item_suggestion_popup", None)
+        if popup is not None and popup.winfo_exists():
+            popup.withdraw()
+        return "break"
+
+    def _filter_item_choices(self, combo, variable, event=None):
+        return self._autocomplete_keyrelease(combo, variable, event)
 
     def _refresh_item_dropdowns(self):
         items = self.db.list_items("")
