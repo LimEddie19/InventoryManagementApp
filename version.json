@@ -1,15 +1,21 @@
 {
-    "version": "1.1.0",
-    "notes": [
-        "Added built-in update system",
-        "Added Help → Check for Updates",
-        "Added application version tracking",
-        "Added startup background update checks",
-        "Added update notification dialog",
-        "Added 'Skip This Version' support",
-        "Added update preferences",
-        "Improved update reliability and offline handling",
-        "Various bug fixes and performance improvements"
-    ],
-    "release_url": "https://github.com/LimEddie19/InventoryManagementApp/releases/latest"
+  "version": "1.3.0",
+  "notes": 
+    [
+        "Added item search and autocomplete across inventory, shipments, invoices, and special pricing",
+        "Added scrollable main tabs and detail windows for improved usability on smaller screens",
+        "Improved Special Pricing removal controls with clearer action labels",
+        "Added editing support for open invoices, including item, quantity, and sale-type changes",
+        "Added inventory reconciliation when modifying open invoices",
+        "Added voiding support for open invoices with automatic inventory and customer credit restoration",
+        "Added built-in INTERNAL USE transactions for inventory withdrawals with no sales revenue",
+        "Added detailed shipment history with shipment viewing and inventory correction support",
+        "Redesigned the History tab to group records by invoice, shipment, internal use, and refund",
+        "Added searchable and filterable history with access to the raw inventory audit log",
+        "Added prior-invoice charge adjustments for correcting undercharged closed invoices",
+        "Added combined payment support for closing multiple open invoices for the same customer",
+        "Improved transaction, shipment, and invoice detail workflows",
+        "Various usability, audit-history, and inventory consistency improvements"
+     ],
+  "release_url": "https://github.com/LimEddie19/InventoryManagementApp/releases/latest"
 }
