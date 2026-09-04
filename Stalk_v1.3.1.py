@@ -15,7 +15,7 @@ from html import escape
 
 
 APP_NAME = "Stalk"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # GitHub-hosted release metadata used by Help > Check for Updates.
 UPDATE_INFO_URL = (
@@ -993,22 +993,39 @@ class InventoryDB:
         if status != "open":
             raise ValueError("Only open invoices can be edited.")
 
-        cur.execute("SELECT item_id, unit_qty FROM invoice_lines WHERE invoice_id = ?;", (invoice_id,))
+        cur.execute("""
+            SELECT id, item_id, item_name, qty, sale_type, unit_qty,
+                   units_per_box, base_price, surcharge_amount,
+                   COALESCE(surcharge_reason,''), unit_price, line_total
+            FROM invoice_lines
+            WHERE invoice_id = ?
+            ORDER BY id;
+        """, (invoice_id,))
+        old_rows = cur.fetchall()
+
         old_units = {}
-        for item_id, unit_qty in cur.fetchall():
-            old_units[item_id] = old_units.get(item_id, 0) + int(unit_qty)
+        for row in old_rows:
+            old_units[row[1]] = old_units.get(row[1], 0) + int(row[5])
 
         new_units = {}
-        subtotal = 0.0
         validated = []
+        item_subtotal = 0.0
 
         for line in lines:
-            item_id, item_name, qty, sale_type, unit_qty, units_per_box, base_price, surcharge_amount, charged_price, pricing_type, surcharge_reason = line
+            (
+                item_id, item_name, qty, sale_type, unit_qty, units_per_box,
+                base_price, surcharge_amount, charged_price, pricing_type,
+                surcharge_reason
+            ) = line
+
             qty = int(qty)
             unit_qty = int(unit_qty)
             units_per_box = int(units_per_box)
+
             if qty <= 0 or unit_qty <= 0:
-                raise ValueError(f"Quantity for {item_name} must be greater than zero.")
+                raise ValueError(
+                    f"Quantity for {item_name} must be greater than zero."
+                )
             if sale_type not in {"box", "unit"}:
                 raise ValueError("Sale type must be box or unit.")
 
@@ -1019,12 +1036,22 @@ class InventoryDB:
 
             new_units[item_id] = new_units.get(item_id, 0) + unit_qty
             line_total = float(charged_price) * qty
-            subtotal += line_total
-            validated.append((
-                int(item_id), str(item_name), qty, sale_type, unit_qty, units_per_box,
-                float(base_price), float(surcharge_amount), str(surcharge_reason or ""),
-                float(charged_price), line_total
-            ))
+            item_subtotal += line_total
+
+            validated.append({
+                "item_id": int(item_id),
+                "item_name": str(item_name),
+                "qty": qty,
+                "sale_type": sale_type,
+                "unit_qty": unit_qty,
+                "units_per_box": units_per_box,
+                "base_price": float(base_price),
+                "surcharge_amount": float(surcharge_amount),
+                "surcharge_reason": str(surcharge_reason or ""),
+                "charged_price": float(charged_price),
+                "line_total": line_total,
+                "old_id": None,
+            })
 
         all_item_ids = set(old_units) | set(new_units)
         for item_id in all_item_ids:
@@ -1032,20 +1059,40 @@ class InventoryDB:
             row = cur.fetchone()
             if not row:
                 raise ValueError("An item on this invoice no longer exists.")
+
             item_name, current_qty = row
             available = int(current_qty) + old_units.get(item_id, 0)
             requested = new_units.get(item_id, 0)
             if requested > available:
                 raise ValueError(
-                    f"Not enough stock for {item_name}. Available for this edited invoice: "
-                    f"{available}; requested: {requested}."
+                    f"Not enough stock for {item_name}. "
+                    f"Available for this edited invoice: {available}; "
+                    f"requested: {requested}."
                 )
 
-        subtotal += self.get_invoice_adjustment_total(invoice_id)
+        # Preserve invoice_line IDs wherever the edited line still represents
+        # the same inventory item. Quantity and box/unit changes are UPDATEs,
+        # not delete/reinsert operations.
+        unused_old = list(old_rows)
+        for new_line in validated:
+            match_index = None
+            for index, old in enumerate(unused_old):
+                if int(old[1]) == new_line["item_id"]:
+                    match_index = index
+                    break
+            if match_index is not None:
+                matched = unused_old.pop(match_index)
+                new_line["old_id"] = int(matched[0])
 
+        adjustment_total = 0.0
+        if hasattr(self, "get_invoice_adjustment_total"):
+            adjustment_total = self.get_invoice_adjustment_total(invoice_id)
+
+        subtotal = item_subtotal + adjustment_total
         discount_percent = float(discount_percent or 0)
         discount_amount = subtotal * (discount_percent / 100.0)
         before_credit = max(0.0, subtotal - discount_amount)
+
         old_credit = float(old_credit or 0)
         new_credit = min(old_credit, before_credit)
         returned_credit = max(0.0, old_credit - new_credit)
@@ -1054,49 +1101,108 @@ class InventoryDB:
         try:
             self.conn.execute("BEGIN")
 
+            # Inventory changes only by the net difference.
             for item_id in all_item_ids:
                 stock_delta = old_units.get(item_id, 0) - new_units.get(item_id, 0)
                 if stock_delta:
-                    cur.execute(
-                        "UPDATE items SET qty = qty + ?, updated_at = ? WHERE id = ?;",
-                        (stock_delta, now_str(), item_id)
-                    )
                     cur.execute("""
-                        INSERT INTO txns(type, ref_number, item_id, qty_change, note, created_at)
+                        UPDATE items
+                        SET qty = qty + ?, updated_at = ?
+                        WHERE id = ?;
+                    """, (stock_delta, now_str(), item_id))
+
+                    cur.execute("""
+                        INSERT INTO txns(
+                            type, ref_number, item_id, qty_change, note, created_at
+                        )
                         VALUES ('INVOICE', ?, ?, ?, ?, ?);
                     """, (
                         ref_number, item_id, stock_delta,
                         "Open invoice edit adjustment", now_str()
                     ))
 
-            cur.execute("DELETE FROM invoice_lines WHERE invoice_id = ?;", (invoice_id,))
-            for item_id, item_name, qty, sale_type, unit_qty, units_per_box, base_price, surcharge_amount, surcharge_reason, charged_price, line_total in validated:
+            # Existing same-item lines are updated IN PLACE.
+            for line in validated:
+                if line["old_id"] is not None:
+                    cur.execute("""
+                        UPDATE invoice_lines
+                        SET item_id = ?,
+                            item_name = ?,
+                            qty = ?,
+                            sale_type = ?,
+                            unit_qty = ?,
+                            units_per_box = ?,
+                            base_price = ?,
+                            surcharge_amount = ?,
+                            surcharge_reason = ?,
+                            unit_price = ?,
+                            line_total = ?
+                        WHERE id = ? AND invoice_id = ?;
+                    """, (
+                        line["item_id"], line["item_name"], line["qty"],
+                        line["sale_type"], line["unit_qty"],
+                        line["units_per_box"], line["base_price"],
+                        line["surcharge_amount"], line["surcharge_reason"],
+                        line["charged_price"], line["line_total"],
+                        line["old_id"], invoice_id
+                    ))
+                else:
+                    cur.execute("""
+                        INSERT INTO invoice_lines(
+                            invoice_id, item_id, item_name, qty, sale_type,
+                            unit_qty, units_per_box, base_price,
+                            surcharge_amount, surcharge_reason,
+                            unit_price, line_total
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """, (
+                        invoice_id, line["item_id"], line["item_name"],
+                        line["qty"], line["sale_type"], line["unit_qty"],
+                        line["units_per_box"], line["base_price"],
+                        line["surcharge_amount"], line["surcharge_reason"],
+                        line["charged_price"], line["line_total"]
+                    ))
+
+            # Any unmatched old rows are genuinely removed lines.
+            # Do not delete a line that a refund already references.
+            for old in unused_old:
+                old_line_id = int(old[0])
                 cur.execute("""
-                    INSERT INTO invoice_lines(
-                        invoice_id, item_id, item_name, qty, sale_type, unit_qty,
-                        units_per_box, base_price, surcharge_amount, surcharge_reason,
-                        unit_price, line_total
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, (
-                    invoice_id, item_id, item_name, qty, sale_type, unit_qty,
-                    units_per_box, base_price, surcharge_amount, surcharge_reason,
-                    charged_price, line_total
-                ))
+                    SELECT COUNT(*)
+                    FROM refund_lines
+                    WHERE invoice_line_id = ?;
+                """, (old_line_id,))
+                if int(cur.fetchone()[0]) > 0:
+                    raise ValueError(
+                        f"Cannot remove invoice line '{old[2]}' because a refund "
+                        "already references that exact line. Modify its quantity "
+                        "instead, or handle the refund relationship first."
+                    )
+
+                cur.execute(
+                    "DELETE FROM invoice_lines WHERE id = ? AND invoice_id = ?;",
+                    (old_line_id, invoice_id)
+                )
 
             cur.execute("""
                 UPDATE invoices
                 SET subtotal = ?, discount_amount = ?, credit = ?, total = ?
                 WHERE id = ? AND status = 'open';
-            """, (subtotal, discount_amount, new_credit, total, invoice_id))
+            """, (
+                subtotal, discount_amount, new_credit, total, invoice_id
+            ))
 
             if returned_credit > 0 and customer_id is not None:
-                cur.execute(
-                    "UPDATE customers SET credit_balance = credit_balance + ?, updated_at = ? WHERE id = ?;",
-                    (returned_credit, now_str(), customer_id)
-                )
                 cur.execute("""
-                    INSERT INTO customer_credit_history
-                        (customer_id, amount, entry_type, reference, note, created_at)
+                    UPDATE customers
+                    SET credit_balance = credit_balance + ?, updated_at = ?
+                    WHERE id = ?;
+                """, (returned_credit, now_str(), customer_id))
+
+                cur.execute("""
+                    INSERT INTO customer_credit_history(
+                        customer_id, amount, entry_type, reference, note, created_at
+                    )
                     VALUES (?, ?, 'ADJUSTMENT', ?, ?, ?);
                 """, (
                     customer_id, returned_credit, f"Invoice {ref_number}",
@@ -1104,11 +1210,13 @@ class InventoryDB:
                 ))
 
             self.conn.commit()
+
         except Exception:
             self.conn.rollback()
             raise
 
         return subtotal, discount_amount, new_credit, total
+
 
     def list_open_invoices_for_customer(self, customer_id):
         cur = self.conn.cursor()
