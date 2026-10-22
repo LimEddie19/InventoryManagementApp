@@ -15,7 +15,7 @@ from html import escape
 
 
 APP_NAME = "Stalk"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.1"
 
 # GitHub-hosted release metadata used by Help > Check for Updates.
 UPDATE_INFO_URL = (
@@ -3428,8 +3428,8 @@ class App(tk.Tk):
         ttk.Label(
             content,
             text=(
-                "Select the open invoices being paid together. "
-                "Each invoice remains a separate record and reference number."
+                "Click the checkbox beside each invoice to include it in the payment. "
+                "Unselected invoices will remain open. Each invoice keeps its own reference number."
             ),
             foreground="#666",
             wraplength=760,
@@ -3508,7 +3508,32 @@ class App(tk.Tk):
             tree.item(iid, values=values)
             refresh_selected_total()
 
+        def on_invoice_click(event):
+            # A single click in the Pay column toggles the invoice checkbox.
+            if tree.identify_region(event.x, event.y) == "cell" and tree.identify_column(event.x) == "#1":
+                toggle_selected(event)
+                return "break"
+
+        def on_invoice_space(event):
+            for iid in tree.selection():
+                if iid in row_map:
+                    toggle_selected_for_id(iid)
+            return "break"
+
+        def toggle_selected_for_id(iid):
+            values = list(tree.item(iid, "values"))
+            if iid in selected_ids:
+                selected_ids.remove(iid)
+                values[0] = "☐"
+            else:
+                selected_ids.add(iid)
+                values[0] = "☑"
+            tree.item(iid, values=values)
+            refresh_selected_total()
+
+        tree.bind("<Button-1>", on_invoice_click)
         tree.bind("<Double-1>", toggle_selected)
+        tree.bind("<space>", on_invoice_space)
 
         controls = ttk.Frame(content)
         controls.pack(fill="x", pady=(4, 0))
@@ -3538,10 +3563,10 @@ class App(tk.Tk):
                 if len(selected_ids) < 2:
                     raise ValueError("Select at least two invoices for a combined payment.")
 
-                invoice_ids = [row_map[iid][0] for iid in selected_ids]
+                invoice_ids = [row_map[iid][0] for iid in row_map if iid in selected_ids]
                 payment_method = payment_var.get().strip() or "other"
                 selected_total = sum(row_map[iid][2] for iid in selected_ids)
-                refs = ", ".join(row_map[iid][1] for iid in selected_ids)
+                refs = ", ".join(row_map[iid][1] for iid in row_map if iid in selected_ids)
 
                 if not messagebox.askyesno(
                     "Complete Combined Payment",
